@@ -139,8 +139,8 @@ test("renders failed retry state and initialization failure message", () => {
   expect(screen.getByRole("button", { name: "安装 Codex" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "安装 Claude Code" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "全部安装" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "重试当前阶段" })).toBeEnabled();
-  expect(screen.getByRole("button", { name: "重新执行全部安装" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "重试当前阶段" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "重新执行全部安装" })).toBeDisabled();
   expect(onRetryStage).not.toHaveBeenCalled();
   expect(onRetryAll).not.toHaveBeenCalled();
 });
@@ -176,4 +176,34 @@ test("shows retry actions when the snapshot is failed", () => {
 
   expect(screen.getByRole("button", { name: "重试当前阶段" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "重新执行全部安装" })).toBeEnabled();
+});
+
+test("disables install and retry actions while snapshot refresh is running", () => {
+  render(
+    <InstallerPage
+      snapshot={{
+        currentStage: "failed",
+        progressPercent: 65,
+        components: [],
+        logs: [],
+        lastError: "install failed"
+      }}
+      isBusy={false}
+      hasInitializationError={false}
+      isRefreshingSnapshot
+      onInstallCodex={vi.fn()}
+      onInstallClaudeCode={vi.fn()}
+      onInstallAll={vi.fn()}
+      onRefreshSnapshot={vi.fn()}
+      onRetryStage={vi.fn()}
+      onRetryAll={vi.fn()}
+    />
+  );
+
+  expect(screen.getByRole("button", { name: "刷新中..." })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "安装 Codex" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "安装 Claude Code" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "全部安装" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "重试当前阶段" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "重新执行全部安装" })).toBeDisabled();
 });

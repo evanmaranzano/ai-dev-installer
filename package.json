@@ -1,5 +1,5 @@
 {
-  "name": "codex-deploy",
+  "name": "ai-dev-installer",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,6 +7,11 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "test:rust": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-rust.ps1",
+    "audit:prod": "npm audit --omit=dev --audit-level=moderate",
+    "verify:resources": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-third-party-resources.ps1",
+    "release:check": "npm test && npm run test:rust && npm run audit:prod && npm run verify:resources",
+    "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1",
     "tauri": "tauri"
   },
   "dependencies": {

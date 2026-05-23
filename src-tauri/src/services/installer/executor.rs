@@ -1,8 +1,9 @@
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 use crate::models::installer::{InstallStageId, InstallerLogEntry};
+
+const CODEX_STORE_PRODUCT_ID: &str = "9PLM9XGG6VKS";
 
 pub struct StageExecutionResult {
     pub next_stage: InstallStageId,
@@ -30,7 +31,7 @@ pub fn codex_install_commands() -> Vec<PlannedCommand> {
         args: vec![
             "install".into(),
             "--id".into(),
-            "9PLM9XGG6VKS".into(),
+            CODEX_STORE_PRODUCT_ID.into(),
             "--source".into(),
             "msstore".into(),
             "--accept-source-agreements".into(),
@@ -38,6 +39,40 @@ pub fn codex_install_commands() -> Vec<PlannedCommand> {
             "--silent".into(),
         ],
     }]
+}
+
+pub fn microsoft_store_service_repair_commands() -> Vec<PlannedCommand> {
+    ["AppXSvc", "ClipSVC", "InstallService"]
+        .into_iter()
+        .flat_map(|service| {
+            [
+                PlannedCommand {
+                    program: "sc.exe".into(),
+                    args: vec![
+                        "config".into(),
+                        service.into(),
+                        "start=".into(),
+                        "demand".into(),
+                    ],
+                },
+                PlannedCommand {
+                    program: "sc.exe".into(),
+                    args: vec!["start".into(), service.into()],
+                },
+            ]
+        })
+        .collect()
+}
+
+pub fn microsoft_store_product_uri() -> String {
+    format!("ms-windows-store://pdp/?ProductId={CODEX_STORE_PRODUCT_ID}")
+}
+
+pub fn microsoft_store_product_page_command() -> PlannedCommand {
+    PlannedCommand {
+        program: "explorer.exe".into(),
+        args: vec![microsoft_store_product_uri()],
+    }
 }
 
 pub fn claude_code_install_commands() -> Vec<PlannedCommand> {
@@ -89,18 +124,21 @@ pub fn winget_candidate_paths() -> Vec<PathBuf> {
 }
 
 fn find_program_on_path(program: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-
-    for dir in std::env::split_paths(&path) {
-        for candidate_name in executable_names(program) {
-            let candidate = dir.join(candidate_name);
-            if candidate.exists() {
-                return Some(candidate.display().to_string());
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for candidate_name in executable_names(program) {
+                let candidate = dir.join(candidate_name);
+                if candidate.exists() {
+                    return Some(candidate.display().to_string());
+                }
             }
         }
     }
 
-    None
+    known_program_candidate_paths(program)
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| path.display().to_string())
 }
 
 fn executable_names(program: &str) -> Vec<String> {
@@ -117,13 +155,43 @@ fn executable_names(program: &str) -> Vec<String> {
     }
 }
 
+fn known_program_candidate_paths(program: &str) -> Vec<PathBuf> {
+    let normalized = program.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+
+    match normalized.as_str() {
+        "npm" | "npm.cmd" | "npm.exe" | "npm.bat" => {
+            push_base_candidates(&mut candidates, &[r"nodejs\npm.cmd"]);
+        }
+        _ => {}
+    }
+
+    candidates
+}
+
+fn push_base_candidates(candidates: &mut Vec<PathBuf>, relative_paths: &[&str]) {
+    for env_name in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(base) = std::env::var_os(env_name) {
+            for relative_path in relative_paths {
+                candidates.push(PathBuf::from(&base).join(relative_path));
+            }
+        }
+    }
+
+    for base in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+        for relative_path in relative_paths {
+            candidates.push(Path::new(base).join(relative_path));
+        }
+    }
+}
+
 pub fn third_party_install_command(
     _component_id: &str,
     file_name: &str,
     install_args: &[String],
     resource_root: &Path,
 ) -> Result<PlannedCommand, AppError> {
-    let resource_path = resource_root.join(file_name);
+    let resource_path = bundled_resource_path(file_name, resource_root)?;
     let normalized = normalize_installer_resource_path(&resource_path);
 
     if file_name.to_ascii_lowercase().ends_with(".msi") {
@@ -140,6 +208,44 @@ pub fn third_party_install_command(
         program: normalized,
         args: install_args.to_vec(),
     })
+}
+
+pub fn bundled_resource_path(file_name: &str, resource_root: &Path) -> Result<PathBuf, AppError> {
+    validate_bundled_resource_file_name(file_name)?;
+    Ok(resource_root.join(file_name))
+}
+
+fn validate_bundled_resource_file_name(file_name: &str) -> Result<(), AppError> {
+    if file_name.trim().is_empty() {
+        return Err(invalid_resource_path(file_name));
+    }
+
+    let path = Path::new(file_name);
+    if path.is_absolute() {
+        return Err(invalid_resource_path(file_name));
+    }
+
+    let mut has_file_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => has_file_component = true,
+            _ => return Err(invalid_resource_path(file_name)),
+        }
+    }
+
+    if !has_file_component {
+        return Err(invalid_resource_path(file_name));
+    }
+
+    Ok(())
+}
+
+fn invalid_resource_path(file_name: &str) -> AppError {
+    AppError {
+        code: "installer_resource_path_invalid".into(),
+        message: "Bundled installer resource path is invalid".into(),
+        details: Some(file_name.to_string()),
+    }
 }
 
 fn normalize_installer_resource_path(path: &Path) -> String {
@@ -188,15 +294,6 @@ pub fn stage_sequence(flow: &str) -> Vec<InstallStageId> {
             InstallStageId::InstallClaudeCode,
             InstallStageId::Verify,
         ],
-        _ => vec![
-            InstallStageId::Preflight,
-            InstallStageId::InstallGit,
-            InstallStageId::InstallPython,
-            InstallStageId::InstallNode,
-            InstallStageId::InstallCcSwitch,
-            InstallStageId::RefreshEnvironment,
-            InstallStageId::InstallCodex,
-            InstallStageId::Verify,
-        ],
+        _ => vec![],
     }
 }

@@ -2,6 +2,10 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::models::installer::{
     InstallStageId, InstallerComponentState, InstallerComponentStatus, InstallerSnapshot,
@@ -26,22 +30,170 @@ pub trait EnvironmentProbe {
     fn detect_appx_package(&self, package_name: &str) -> Option<DetectedBinary>;
 }
 
-pub struct DetectExecutionEnvironment;
+pub struct DetectExecutionEnvironment {
+    refreshed_path: OnceLock<Option<OsString>>,
+    #[cfg(test)]
+    refreshed_path_build_count: AtomicUsize,
+}
+
+impl DetectExecutionEnvironment {
+    pub fn new() -> Self {
+        Self {
+            refreshed_path: OnceLock::new(),
+            #[cfg(test)]
+            refreshed_path_build_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn detect_path(&self, command: &str) -> Option<String> {
+        let output = self.command_output("where", &[command]).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        String::from_utf8(output.stdout)
+            .ok()?
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.to_string())
+    }
+
+    fn detect_version(&self, command: &str) -> Option<String> {
+        let flag = version_flag(command);
+        let output = self.command_output(command, &[flag]).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        first_non_empty_output_line(output)
+    }
+
+    fn detect_python_local_install(&self) -> Option<DetectedBinary> {
+        let mut candidates = vec![
+            std::path::PathBuf::from(r"C:\Program Files\Python312\python.exe"),
+            std::path::PathBuf::from(r"C:\Program Files\Python313\python.exe"),
+        ];
+
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(
+                std::path::PathBuf::from(&base)
+                    .join("Programs")
+                    .join("Python")
+                    .join("Python312")
+                    .join("python.exe"),
+            );
+            candidates.push(
+                std::path::PathBuf::from(base)
+                    .join("Programs")
+                    .join("Python")
+                    .join("Python313")
+                    .join("python.exe"),
+            );
+        }
+
+        for candidate in candidates {
+            if candidate.exists() {
+                let version = candidate
+                    .to_str()
+                    .and_then(|path| self.command_output(path, &["--version"]).ok())
+                    .and_then(first_non_empty_output_line);
+
+                return Some(DetectedBinary {
+                    version,
+                    path: Some(candidate.display().to_string()),
+                });
+            }
+        }
+
+        None
+    }
+
+    fn detect_appx_package_impl(&self, package_name: &str) -> Option<DetectedBinary> {
+        let script = format!(
+            "(Get-AppxPackage -Name '{package_name}' -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {{ \"{{0}}|{{1}}\" -f $_.Version, $_.InstallLocation }})"
+        );
+        let output = self
+            .command_output("powershell.exe", &["-NoProfile", "-Command", &script])
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let line = String::from_utf8(output.stdout).ok()?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let mut parts = trimmed.splitn(2, '|');
+        let version = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let path = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        Some(DetectedBinary {
+            version: version.map(|value| value.to_string()),
+            path: path.map(|value| value.to_string()),
+        })
+    }
+
+    fn command_output(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Some(path) = self.refreshed_path_env() {
+            command.env("PATH", path);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command.output()
+    }
+
+    fn refreshed_path_env(&self) -> Option<OsString> {
+        self.refreshed_path
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.refreshed_path_build_count
+                    .fetch_add(1, Ordering::SeqCst);
+
+                refreshed_path_env()
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn refreshed_path_env_build_count_for_tests(&self) -> usize {
+        self.refreshed_path_build_count.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for DetectExecutionEnvironment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl EnvironmentProbe for DetectExecutionEnvironment {
     fn is_admin(&self) -> bool {
-        command_output("net", &["session"])
+        self.command_output("net", &["session"])
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
 
     fn detect_binary(&self, command: &str) -> Option<DetectedBinary> {
-        let path = detect_path(command)
+        let path = self
+            .detect_path(command)
             .or_else(|| detect_known_binary_path(command).map(|path| path.display().to_string()));
         let version = match (command, path.as_deref()) {
             ("cc-switch" | "cc-switch.exe", _) => None,
-            (_, Some(path)) => detect_version(path),
-            _ => detect_version(command),
+            (_, Some(path)) => self.detect_version(path),
+            _ => self.detect_version(command),
         };
 
         if path.is_none() && version.is_none() {
@@ -54,13 +206,13 @@ impl EnvironmentProbe for DetectExecutionEnvironment {
     fn detect_known_install(&self, component_id: &str) -> Option<DetectedBinary> {
         match component_id {
             "cc_switch" => detect_cc_switch_local_install(),
-            "python" => detect_python_local_install(),
+            "python" => self.detect_python_local_install(),
             _ => None,
         }
     }
 
     fn detect_appx_package(&self, package_name: &str) -> Option<DetectedBinary> {
-        detect_appx_package(package_name)
+        self.detect_appx_package_impl(package_name)
     }
 }
 
@@ -232,46 +384,6 @@ fn python_component_from_detection(probe: &dyn EnvironmentProbe) -> InstallerCom
     }
 }
 
-fn detect_python_local_install() -> Option<DetectedBinary> {
-    let mut candidates = vec![
-        std::path::PathBuf::from(r"C:\Program Files\Python312\python.exe"),
-        std::path::PathBuf::from(r"C:\Program Files\Python313\python.exe"),
-    ];
-
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(
-            std::path::PathBuf::from(&base)
-                .join("Programs")
-                .join("Python")
-                .join("Python312")
-                .join("python.exe"),
-        );
-        candidates.push(
-            std::path::PathBuf::from(base)
-                .join("Programs")
-                .join("Python")
-                .join("Python313")
-                .join("python.exe"),
-        );
-    }
-
-    for candidate in candidates {
-        if candidate.exists() {
-            let version = candidate
-                .to_str()
-                .and_then(|path| command_output(path, &["--version"]).ok())
-                .and_then(first_non_empty_output_line);
-
-            return Some(DetectedBinary {
-                version,
-                path: Some(candidate.display().to_string()),
-            });
-        }
-    }
-
-    None
-}
-
 fn component_from_detection(
     probe: &dyn EnvironmentProbe,
     command: &str,
@@ -300,30 +412,6 @@ fn component_id(label: &str) -> String {
         .to_ascii_lowercase()
         .replace('.', "")
         .replace(' ', "_")
-}
-
-fn detect_path(command: &str) -> Option<String> {
-    let output = command_output("where", &[command]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.to_string())
-}
-
-fn detect_version(command: &str) -> Option<String> {
-    let flag = version_flag(command);
-    let output = command_output(command, &[flag]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    first_non_empty_output_line(output)
 }
 
 fn detect_known_binary_path(command: &str) -> Option<PathBuf> {
@@ -366,50 +454,6 @@ fn push_program_files_candidates(candidates: &mut Vec<PathBuf>, relative_paths: 
             candidates.push(Path::new(base).join(relative_path));
         }
     }
-}
-
-fn detect_appx_package(package_name: &str) -> Option<DetectedBinary> {
-    let script = format!(
-        "(Get-AppxPackage -Name '{package_name}' -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {{ \"{{0}}|{{1}}\" -f $_.Version, $_.InstallLocation }})"
-    );
-    let output = command_output("powershell.exe", &["-NoProfile", "-Command", &script]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let line = String::from_utf8(output.stdout).ok()?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut parts = trimmed.splitn(2, '|');
-    let version = parts
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let path = parts
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    Some(DetectedBinary {
-        version: version.map(|value| value.to_string()),
-        path: path.map(|value| value.to_string()),
-    })
-}
-
-fn command_output(program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new(program);
-    command.args(args);
-    if let Some(path) = refreshed_path_env() {
-        command.env("PATH", path);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command.output()
 }
 
 fn refreshed_path_env() -> Option<OsString> {

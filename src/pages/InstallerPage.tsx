@@ -29,7 +29,9 @@ export function InstallerPage({
   onRetryStage,
   onRetryAll
 }: InstallerPageProps) {
-  const areInstallActionsDisabled = isBusy || hasInitializationError;
+  const areInstallActionsDisabled = isBusy || isRefreshingSnapshot || hasInitializationError;
+  const areRetryActionsDisabled =
+    isBusy || isRefreshingSnapshot || hasInitializationError || snapshot.currentStage !== "failed";
 
   return (
     <section style={{ display: "grid", gap: "24px" }}>
@@ -162,14 +164,14 @@ export function InstallerPage({
         </button>
         <button
           type="button"
-          disabled={isBusy || snapshot.currentStage !== "failed"}
+          disabled={areRetryActionsDisabled}
           onClick={onRetryStage}
         >
           重试当前阶段
         </button>
         <button
           type="button"
-          disabled={isBusy || snapshot.currentStage !== "failed"}
+          disabled={areRetryActionsDisabled}
           onClick={onRetryAll}
         >
           重新执行全部安装

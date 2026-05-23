@@ -28,6 +28,7 @@ pub async fn refresh_installer_snapshot() -> Result<InstallerSnapshot, AppError>
 #[tauri::command]
 pub async fn start_install_flow(app: AppHandle, flow: String) -> Result<(), AppError> {
     let service = InstallerService::production();
+    service.validate_flow(&flow)?;
     let guard = service.reserve_flow()?;
 
     tauri::async_runtime::spawn(async move {

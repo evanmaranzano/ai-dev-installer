@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -16,8 +16,10 @@ use crate::models::installer::{
 };
 use crate::services::installer::environment::{build_initial_snapshot, DetectExecutionEnvironment};
 use crate::services::installer::executor::{
-    claude_code_install_commands, codex_install_commands, command_display, stage_sequence,
-    third_party_install_command, PlannedCommand,
+    bundled_resource_path, claude_code_install_commands, codex_install_commands, command_display,
+    microsoft_store_product_page_command, microsoft_store_product_uri,
+    microsoft_store_service_repair_commands, stage_sequence, third_party_install_command,
+    PlannedCommand,
 };
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 
@@ -57,6 +59,10 @@ impl InstallerService {
         Self
     }
 
+    pub fn validate_flow(&self, flow: &str) -> Result<(), AppError> {
+        validate_flow(flow)
+    }
+
     pub fn load_snapshot(&self) -> Result<InstallerSnapshot, AppError> {
         let guard = session_state().lock().map_err(|_| AppError {
             code: "installer_state_poisoned".into(),
@@ -67,7 +73,7 @@ impl InstallerService {
         if let Some(snapshot) = guard.snapshot.clone() {
             Ok(snapshot)
         } else {
-            Ok(build_initial_snapshot(&DetectExecutionEnvironment))
+            Ok(build_execution_snapshot())
         }
     }
 
@@ -76,7 +82,7 @@ impl InstallerService {
             return self.load_snapshot();
         }
 
-        let snapshot = build_initial_snapshot(&DetectExecutionEnvironment);
+        let snapshot = build_execution_snapshot();
         persist_latest_snapshot(snapshot.clone())?;
         Ok(snapshot)
     }
@@ -93,8 +99,9 @@ impl InstallerService {
     }
 
     pub fn snapshot_updates_for(&self, flow: &str) -> Result<Vec<InstallerSnapshot>, AppError> {
-        let mut snapshot = build_initial_snapshot(&DetectExecutionEnvironment);
+        let mut snapshot = build_execution_snapshot();
         let stages = stage_sequence(flow);
+        validate_stages(flow, &stages)?;
         let stage_count = stages.len();
         let mut snapshots = Vec::with_capacity(stage_count + 1);
 
@@ -127,7 +134,7 @@ impl InstallerService {
         &self,
         failed_stage: InstallStageId,
     ) -> Result<Vec<InstallerSnapshot>, AppError> {
-        let mut snapshot = build_initial_snapshot(&DetectExecutionEnvironment);
+        let mut snapshot = build_execution_snapshot();
         let flow = match failed_stage {
             InstallStageId::InstallCodex => "install_codex",
             InstallStageId::InstallClaudeCode => "install_claude_code",
@@ -168,6 +175,7 @@ impl InstallerService {
     }
 
     pub async fn run_flow(&self, app: &AppHandle, flow: &str) -> Result<(), AppError> {
+        validate_flow(flow)?;
         let guard = self.reserve_flow()?;
         self.run_reserved_flow(app, flow, guard).await
     }
@@ -178,7 +186,8 @@ impl InstallerService {
         flow: &str,
         _flow_guard: InstallerFlowGuard,
     ) -> Result<(), AppError> {
-        let mut snapshot = build_initial_snapshot(&DetectExecutionEnvironment);
+        validate_flow(flow)?;
+        let mut snapshot = build_execution_snapshot();
         snapshot.logs.clear();
 
         {
@@ -191,6 +200,7 @@ impl InstallerService {
         emit_snapshot(app, &snapshot)?;
 
         let stages = stage_sequence(flow);
+        validate_stages(flow, &stages)?;
         let stage_count = stages.len();
         for (index, stage) in stages.iter().enumerate() {
             snapshot.current_stage = stage.clone();
@@ -263,16 +273,29 @@ impl InstallerService {
     ) -> Result<(), AppError> {
         let (flow, failed_stage) = {
             let guard = lock_session_state()?;
-            let flow = guard
-                .last_flow
-                .clone()
-                .unwrap_or_else(|| "install_all".into());
-            let stage = guard
-                .failed_stage
-                .clone()
-                .unwrap_or(InstallStageId::Preflight);
+            let flow = guard.last_flow.clone().ok_or_else(|| AppError {
+                code: "installer_retry_context_missing".into(),
+                message: "No failed installer flow is available to retry".into(),
+                details: None,
+            })?;
+            let stage = guard.failed_stage.clone().ok_or_else(|| AppError {
+                code: "installer_retry_context_missing".into(),
+                message: "No failed installer stage is available to retry".into(),
+                details: None,
+            })?;
             (flow, stage)
         };
+
+        let flow_stages = stage_sequence(&flow);
+        if !flow_stages.contains(&failed_stage) {
+            return Err(AppError {
+                code: "installer_retry_stage_mismatch".into(),
+                message: "The failed stage does not belong to the last flow".into(),
+                details: Some(format!(
+                    "flow={flow}, failed_stage={failed_stage:?}, stages={flow_stages:?}"
+                )),
+            });
+        }
 
         let retry_flow = match failed_stage {
             InstallStageId::InstallCodex => "install_codex",
@@ -286,11 +309,10 @@ impl InstallerService {
         self.run_reserved_flow(app, retry_flow, guard).await
     }
 
-    pub fn stage_sequence_for(&self, flow: &str) -> Vec<String> {
-        stage_sequence(flow)
-            .into_iter()
-            .map(|stage| format!("{stage:?}"))
-            .collect()
+    pub fn stage_sequence_for(&self, flow: &str) -> Result<Vec<String>, AppError> {
+        let stages = stage_sequence(flow);
+        validate_stages(flow, &stages)?;
+        Ok(stages.into_iter().map(|stage| format!("{stage:?}")).collect())
     }
 
     async fn execute_stage(
@@ -373,7 +395,7 @@ impl InstallerService {
             details: None,
         })?;
         let resource_root = self.resource_root(app)?;
-        let full_path = resource_root.join(&resource.file_name);
+        let full_path = bundled_resource_path(&resource.file_name, &resource_root)?;
 
         if !verify_sha256(&full_path, &resource.sha256)? {
             return Err(AppError {
@@ -404,30 +426,49 @@ impl InstallerService {
             &resource.install_command,
             &resource_root,
         )?;
-        self.run_command(&command, stage.clone())?;
-
-        let refreshed = build_initial_snapshot(&DetectExecutionEnvironment);
-        if let Some(updated) = refreshed
-            .components
-            .iter()
-            .find(|item| item.id == component_id)
-        {
-            set_component_status(
-                &mut snapshot.components,
-                component_id,
-                updated.status.clone(),
-                updated.detail.clone(),
-                updated.version.clone(),
-            );
+        match self.run_command(&command, stage.clone()) {
+            Ok(()) => {
+                let refreshed = build_execution_snapshot();
+                if let Some(updated) = refreshed
+                    .components
+                    .iter()
+                    .find(|item| item.id == component_id)
+                {
+                    set_component_status(
+                        &mut snapshot.components,
+                        component_id,
+                        updated.status.clone(),
+                        updated.detail.clone(),
+                        updated.version.clone(),
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                set_component_status(
+                    &mut snapshot.components,
+                    component_id,
+                    InstallerComponentStatus::Failed,
+                    format!("{} 安装失败", resource.file_name),
+                    None,
+                );
+                snapshot.logs.push(build_log_entry(
+                    stage.clone(),
+                    "error",
+                    format!("{} 安装失败：{}", component_id, error.message),
+                ));
+                persist_latest_snapshot(snapshot.clone())?;
+                emit_snapshot(app, snapshot)?;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     fn execute_refresh_environment(
         &self,
         snapshot: &mut InstallerSnapshot,
     ) -> Result<(), AppError> {
-        let refreshed = build_initial_snapshot(&DetectExecutionEnvironment);
+        let refreshed = build_execution_snapshot();
         for updated in refreshed.components {
             if snapshot.current_stage == InstallStageId::RefreshEnvironment
                 && component_status(&snapshot.components, &updated.id)
@@ -478,16 +519,27 @@ impl InstallerService {
         persist_latest_snapshot(snapshot.clone())?;
         emit_snapshot(app, snapshot)?;
 
-        self.run_commands(&codex_install_commands(), InstallStageId::InstallCodex)
-            .map_err(|store_error| AppError {
-                code: "installer_codex_store_install_failed".into(),
-                message: "Codex desktop installation from Microsoft Store failed".into(),
-                details: Some(format!(
-                    "{}{}. Please check Microsoft Store, App Installer, and winget, then try again.",
-                    store_error.message,
-                    format_error_details(&store_error)
-                )),
-            })?;
+        self.repair_microsoft_store_services(snapshot)?;
+
+        if let Err(store_error) = self.run_commands(&codex_install_commands(), InstallStageId::InstallCodex) {
+            let _ = self.open_microsoft_store_product_page(snapshot);
+            set_component_status(
+                &mut snapshot.components,
+                "codex",
+                InstallerComponentStatus::Failed,
+                "Codex 安装失败".into(),
+                None,
+            );
+            let wrapped_error = codex_store_install_failure_error(store_error);
+            snapshot.logs.push(build_log_entry(
+                InstallStageId::InstallCodex,
+                "error",
+                format!("Codex 安装失败：{}", wrapped_error.message),
+            ));
+            persist_latest_snapshot(snapshot.clone())?;
+            emit_snapshot(app, snapshot)?;
+            return Err(wrapped_error);
+        }
 
         set_component_status(
             &mut snapshot.components,
@@ -497,6 +549,47 @@ impl InstallerService {
             None,
         );
         Ok(())
+    }
+
+    fn repair_microsoft_store_services(
+        &self,
+        snapshot: &mut InstallerSnapshot,
+    ) -> Result<(), AppError> {
+        let commands = microsoft_store_service_repair_commands();
+        snapshot.logs.push(build_log_entry(
+            InstallStageId::InstallCodex,
+            "info",
+            "正在检查并启动 Microsoft Store 相关服务".into(),
+        ));
+
+        for command in commands {
+            if let Err(error) = self.run_command_with_timeout(&command, InstallStageId::InstallCodex, Duration::from_secs(30)) {
+                snapshot.logs.push(build_log_entry(
+                    InstallStageId::InstallCodex,
+                    "warn",
+                    format!(
+                        "Microsoft Store 服务修复命令未完成：{}{}",
+                        command_display(&command),
+                        format_error_details(&error)
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn open_microsoft_store_product_page(
+        &self,
+        snapshot: &mut InstallerSnapshot,
+    ) -> Result<(), AppError> {
+        let command = microsoft_store_product_page_command();
+        snapshot.logs.push(build_log_entry(
+            InstallStageId::InstallCodex,
+            "warn",
+            format!("winget 安装失败，正在尝试打开 Microsoft Store 页面：{}", microsoft_store_product_uri()),
+        ));
+        self.run_command(&command, InstallStageId::InstallCodex)
     }
 
     fn execute_claude_code_install(
@@ -569,6 +662,7 @@ impl InstallerService {
                 }
                 persist_latest_snapshot(snapshot.clone())?;
                 emit_snapshot(app, snapshot)?;
+                return Err(error);
             }
         }
 
@@ -576,7 +670,7 @@ impl InstallerService {
     }
 
     fn execute_verify(&self, snapshot: &mut InstallerSnapshot, flow: &str) -> Result<(), AppError> {
-        let refreshed = build_initial_snapshot(&DetectExecutionEnvironment);
+        let refreshed = build_execution_snapshot();
         for updated in refreshed.components {
             set_component_status(
                 &mut snapshot.components,
@@ -590,7 +684,7 @@ impl InstallerService {
         let required_components: &[&str] = match flow {
             "install_codex" => &["git", "python", "nodejs", "cc_switch", "codex"],
             "install_claude_code" => &["git", "python", "nodejs", "cc_switch", "claude_code"],
-            "install_all" => &["git", "python", "nodejs", "cc_switch", "codex"],
+            "install_all" => &["git", "python", "nodejs", "cc_switch", "codex", "claude_code"],
             _ => &["git", "python", "nodejs", "cc_switch", "codex"],
         };
 
@@ -608,16 +702,6 @@ impl InstallerService {
             .collect();
 
         if failed.is_empty() {
-            if flow == "install_all"
-                && component_status(&snapshot.components, "claude_code")
-                    == Some(InstallerComponentStatus::Failed)
-            {
-                snapshot.logs.push(build_log_entry(
-                    InstallStageId::Verify,
-                    "warn",
-                    "主流程安装完成，但 Claude Code 安装失败".into(),
-                ));
-            }
             snapshot.logs.push(build_log_entry(
                 InstallStageId::Verify,
                 "info",
@@ -696,10 +780,80 @@ impl InstallerService {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let combined = if stderr.is_empty() {
+                stdout
+            } else if stdout.is_empty() {
+                stderr
+            } else {
+                format!("{stderr}\n{stdout}")
+            };
             Err(AppError {
                 code: format!("installer_command_failed_{}", format_stage(&stage)),
                 message: format!("Command failed: {}", command_display(command)),
-                details: Some(if stderr.is_empty() { stdout } else { stderr }),
+                details: Some(combined),
+            })
+        }
+    }
+
+    fn run_command_with_timeout(
+        &self,
+        command: &PlannedCommand,
+        stage: InstallStageId,
+        timeout: Duration,
+    ) -> Result<(), AppError> {
+        let mut process = Command::new(&command.program);
+        process.args(&command.args);
+        #[cfg(target_os = "windows")]
+        {
+            process.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = process.spawn().map_err(|error| AppError {
+            code: "installer_command_spawn_failed".into(),
+            message: format!("Failed to start {}", command.program),
+            details: Some(error.to_string()),
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
+
+        let output = child.wait_with_output().map_err(|error| AppError {
+            code: "installer_command_output_failed".into(),
+            message: format!("Failed to collect output from {}", command.program),
+            details: Some(error.to_string()),
+        })?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let combined = if stderr.is_empty() {
+                stdout
+            } else if stdout.is_empty() {
+                stderr
+            } else {
+                format!("{stderr}\n{stdout}")
+            };
+            Err(AppError {
+                code: format!("installer_command_failed_{}", format_stage(&stage)),
+                message: format!("Command failed: {}", command_display(command)),
+                details: Some(combined),
             })
         }
     }
@@ -715,6 +869,27 @@ impl InstallerService {
 
 fn session_state() -> &'static Mutex<InstallerSessionState> {
     INSTALLER_SESSION_STATE.get_or_init(|| Mutex::new(InstallerSessionState::default()))
+}
+
+fn build_execution_snapshot() -> InstallerSnapshot {
+    let probe = DetectExecutionEnvironment::new();
+    build_initial_snapshot(&probe)
+}
+
+fn validate_flow(flow: &str) -> Result<(), AppError> {
+    validate_stages(flow, &stage_sequence(flow))
+}
+
+fn validate_stages(flow: &str, stages: &[InstallStageId]) -> Result<(), AppError> {
+    if stages.is_empty() {
+        Err(AppError {
+            code: "invalid_installer_flow".into(),
+            message: "Unknown installer flow".into(),
+            details: Some(flow.to_string()),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn lock_session_state() -> Result<std::sync::MutexGuard<'static, InstallerSessionState>, AppError> {
@@ -737,10 +912,16 @@ fn persist_latest_snapshot(snapshot: InstallerSnapshot) -> Result<(), AppError> 
 }
 
 fn build_log_entry(stage: InstallStageId, level: &str, message: String) -> InstallerLogEntry {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs().to_string())
-        .unwrap_or_else(|_| "0".into());
+    let timestamp = {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs() % 86400;
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        let seconds = secs % 60;
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    };
     InstallerLogEntry {
         timestamp,
         stage,
@@ -821,6 +1002,19 @@ fn format_error_details(error: &AppError) -> String {
         .filter(|details| !details.trim().is_empty())
         .map(|details| format!(" ({details})"))
         .unwrap_or_default()
+}
+
+pub(super) fn codex_store_install_failure_error(store_error: AppError) -> AppError {
+    AppError {
+        code: "installer_codex_store_install_failed".into(),
+        message: "Codex desktop installation from Microsoft Store failed".into(),
+        details: Some(format!(
+            "{}{}. AI Dev Installer has tried to start Microsoft Store services AppXSvc, ClipSVC, and InstallService, then open {}. Please repair Microsoft Store, Microsoft App Installer, or winget if the page did not open.",
+            store_error.message,
+            format_error_details(&store_error),
+            microsoft_store_product_uri()
+        )),
+    }
 }
 
 fn format_stage(stage: &InstallStageId) -> &'static str {

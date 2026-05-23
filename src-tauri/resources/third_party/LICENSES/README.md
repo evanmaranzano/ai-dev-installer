@@ -4,6 +4,7 @@ Store the upstream license texts for bundled installer payloads in this director
 
 Expected files include:
 - `git.txt`
+- `python.txt`
 - `nodejs.txt`
 - `cc_switch.txt`
 

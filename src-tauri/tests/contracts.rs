@@ -6,6 +6,18 @@ use codex_deploy::models::{
 };
 
 #[test]
+fn tauri_config_uses_explicit_content_security_policy() {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config should parse");
+
+    let csp = config["app"]["security"]["csp"]
+        .as_str()
+        .expect("csp should be an explicit policy string");
+    assert!(csp.contains("default-src 'self'"));
+    assert!(csp.contains("img-src 'self' data: asset:"));
+}
+
+#[test]
 fn app_error_has_machine_readable_shape() {
     let err = AppError {
         code: "missing_api_key".to_string(),

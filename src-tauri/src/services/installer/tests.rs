@@ -1,19 +1,26 @@
+use crate::error::AppError;
 use crate::services::installer::environment::{
-    build_initial_snapshot, DetectedBinary, EnvironmentProbe,
+    build_initial_snapshot, DetectExecutionEnvironment, DetectedBinary, EnvironmentProbe,
 };
 use crate::services::installer::executor::{
-    claude_code_install_commands, codex_install_commands, command_display, stage_sequence,
-    third_party_install_command, winget_candidate_paths,
+    claude_code_install_commands, codex_install_commands, command_display,
+    microsoft_store_product_page_command, microsoft_store_product_uri,
+    microsoft_store_service_repair_commands, stage_sequence, third_party_install_command,
+    winget_candidate_paths,
 };
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 use crate::services::installer::service::{
-    component_status, mark_component_skipped_if_installed, InstallerService, InstallerSessionState,
+    codex_store_install_failure_error, component_status, mark_component_skipped_if_installed,
+    InstallerService, InstallerSessionState,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct FakeProbe;
 
@@ -300,6 +307,48 @@ fn plans_codex_install_with_msstore_winget_product_id() {
 }
 
 #[test]
+fn plans_microsoft_store_service_repair_before_codex_install() {
+    let commands = microsoft_store_service_repair_commands();
+    let command_lines: Vec<String> = commands.iter().map(command_display).collect();
+
+    assert_eq!(commands.len(), 6);
+    assert!(command_lines.contains(&"sc.exe config AppXSvc start= demand".to_string()));
+    assert!(command_lines.contains(&"sc.exe start AppXSvc".to_string()));
+    assert!(command_lines.contains(&"sc.exe config ClipSVC start= demand".to_string()));
+    assert!(command_lines.contains(&"sc.exe start ClipSVC".to_string()));
+    assert!(command_lines.contains(&"sc.exe config InstallService start= demand".to_string()));
+    assert!(command_lines.contains(&"sc.exe start InstallService".to_string()));
+}
+
+#[test]
+fn plans_microsoft_store_product_page_wakeup_for_codex() {
+    let command = microsoft_store_product_page_command();
+
+    assert_eq!(microsoft_store_product_uri(), "ms-windows-store://pdp/?ProductId=9PLM9XGG6VKS");
+    assert_eq!(command.program, "explorer.exe");
+    assert_eq!(command.args, vec![microsoft_store_product_uri()]);
+}
+
+#[test]
+fn codex_store_failure_error_mentions_service_repair_and_store_wakeup() {
+    let error = codex_store_install_failure_error(AppError {
+        code: "installer_command_failed_install_codex".into(),
+        message: "Command failed: winget install".into(),
+        details: Some("0x8A150044".into()),
+    });
+
+    assert_eq!(error.code, "installer_codex_store_install_failed");
+    let details = error.details.expect("details should explain recovery actions");
+    assert!(details.contains("Microsoft Store"));
+    assert!(details.contains("App Installer"));
+    assert!(details.contains("AppXSvc"));
+    assert!(details.contains("ClipSVC"));
+    assert!(details.contains("InstallService"));
+    assert!(details.contains("ms-windows-store://pdp/?ProductId=9PLM9XGG6VKS"));
+    assert!(details.contains("0x8A150044"));
+}
+
+#[test]
 fn plans_claude_code_install_with_official_npm_package() {
     let commands = claude_code_install_commands();
 
@@ -327,6 +376,34 @@ fn plans_claude_code_install_with_official_npm_package() {
             "@anthropic-ai/claude-code".to_string(),
         ]
     );
+}
+
+#[test]
+fn plans_claude_code_install_with_refreshed_program_files_path() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-program-files-{unique}"));
+    let node_dir = temp_root.join("nodejs");
+    let npm_path = node_dir.join("npm.cmd");
+
+    fs::create_dir_all(&node_dir).expect("fake node dir should be created");
+    fs::write(&npm_path, b"@echo off\r\n").expect("fake npm command should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_program_files = std::env::var_os("ProgramFiles");
+    std::env::set_var("PATH", "");
+    std::env::set_var("ProgramFiles", &temp_root);
+
+    let commands = claude_code_install_commands();
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("ProgramFiles", original_program_files);
+    fs::remove_dir_all(&temp_root).expect("fake program files dir should be removed");
+
+    assert_eq!(commands[0].program, npm_path.display().to_string());
 }
 
 #[test]
@@ -442,6 +519,19 @@ fn strips_windows_extended_path_prefix_for_msi_installs() {
 }
 
 #[test]
+fn rejects_third_party_manifest_paths_that_escape_resource_root() {
+    let error = third_party_install_command(
+        "git",
+        "../evil.exe",
+        &["/VERYSILENT".into()],
+        Path::new("C:/bundle/resources/third_party"),
+    )
+    .expect_err("parent directory traversal should be rejected");
+
+    assert_eq!(error.code, "installer_resource_path_invalid");
+}
+
+#[test]
 fn stage_sequence_matches_expected_flow_ordering() {
     assert_eq!(
         stage_sequence("install_codex"),
@@ -486,11 +576,23 @@ fn stage_sequence_matches_expected_flow_ordering() {
 }
 
 #[test]
+fn stage_sequence_rejects_unknown_flow_instead_of_defaulting_to_codex() {
+    assert!(stage_sequence("install_codez").is_empty());
+}
+
+fn restore_env_var(name: &str, value: Option<std::ffi::OsString>) {
+    match value {
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
+}
+
+#[test]
 fn installer_service_returns_stage_names_for_requested_flow() {
     let service = InstallerService::production();
 
     assert_eq!(
-        service.stage_sequence_for("install_codex"),
+        service.stage_sequence_for("install_codex").expect("known flow should return stages"),
         vec![
             "Preflight".to_string(),
             "InstallGit".to_string(),
@@ -503,7 +605,7 @@ fn installer_service_returns_stage_names_for_requested_flow() {
         ]
     );
     assert_eq!(
-        service.stage_sequence_for("install_claude_code"),
+        service.stage_sequence_for("install_claude_code").expect("known flow should return stages"),
         vec![
             "Preflight".to_string(),
             "InstallGit".to_string(),
@@ -516,7 +618,7 @@ fn installer_service_returns_stage_names_for_requested_flow() {
         ]
     );
     assert_eq!(
-        service.stage_sequence_for("install_all"),
+        service.stage_sequence_for("install_all").expect("known flow should return stages"),
         vec![
             "Preflight".to_string(),
             "InstallGit".to_string(),
@@ -740,4 +842,15 @@ fn component_status_reports_current_install_state_without_refresh_side_effects()
         component_status(&snapshot.components, "codex"),
         Some(crate::models::installer::InstallerComponentStatus::Installing)
     );
+}
+
+#[test]
+fn execution_environment_reuses_refreshed_path_within_single_probe() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+
+    let probe = DetectExecutionEnvironment::new();
+    let _ = probe.detect_binary("definitely-missing-ai-dev-installer-command");
+    let _ = probe.detect_binary("definitely-missing-ai-dev-installer-command-again");
+
+    assert_eq!(probe.refreshed_path_env_build_count_for_tests(), 1);
 }

@@ -79,19 +79,21 @@ npm run tauri dev
 
 ```bash
 npm run test
-cargo test --manifest-path src-tauri/Cargo.toml
+npm run test:rust
+npm run audit:prod
+npm run verify:resources
 ```
 
 ### 构建安装包
 
 ```bash
-npm run tauri build
+npm run build:installer
 ```
 
 构建产物默认位于：
 
 ```text
-src-tauri/target/release/bundle/nsis/
+src-tauri/target-release/release/bundle/nsis/
 ```
 
 ## 项目结构
@@ -120,6 +122,8 @@ ai-dev-installer/
 - 第三方安装包资源不全部随 Git 仓库分发
 - `src-tauri/resources/third_party/manifest.json` 负责记录资源版本和校验信息
 - 若补齐第三方资源并执行打包，可生成完整 Windows 安装器
+- 发布前应执行 `npm run build:installer`，先跑前后端测试、生产依赖 audit 和第三方 payload 校验，再构建 NSIS 安装包
+- 如需把许可文本作为硬门禁，可运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-third-party-resources.ps1 -RequireLicenses`
 
 ## License
 

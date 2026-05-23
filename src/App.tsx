@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   loadInstallerSnapshot,
   listenInstallerSnapshot,
@@ -34,7 +34,24 @@ function buildTimestamp() {
 }
 
 function toErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    const details =
+      "details" in error && typeof error.details === "string" && error.details.trim()
+        ? ` ${error.details}`
+        : "";
+    return `${error.message}${details}`;
+  }
+
+  return String(error);
 }
 
 function createQueuedFlowSnapshot(
@@ -46,6 +63,11 @@ function createQueuedFlowSnapshot(
     currentStage: "preflight",
     progressPercent: Math.max(snapshot.progressPercent, 1),
     lastError: null,
+    components: snapshot.components.map((component) => ({
+      ...component,
+      status: "checking" as const,
+      detail: "等待重新检测"
+    })),
     logs: [
       ...snapshot.logs,
       {
@@ -84,13 +106,14 @@ export default function App() {
   const [isBusy, setIsBusy] = useState(false);
   const [hasInitializationError, setHasInitializationError] = useState(false);
   const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    let mounted = true;
+    mountedRef.current = true;
     let unlisten: (() => void) | undefined;
 
     const failInitialization = (message: string) => {
-      if (!mounted) {
+      if (!mountedRef.current) {
         return;
       }
 
@@ -101,7 +124,7 @@ export default function App() {
 
     void loadInstallerSnapshot()
       .then((value) => {
-        if (mounted) {
+        if (mountedRef.current) {
           setSnapshot(value);
           setIsBusy(isBusyStage(value.currentStage));
           setHasInitializationError(false);
@@ -112,7 +135,7 @@ export default function App() {
       });
 
     void listenInstallerSnapshot((value) => {
-      if (!mounted) {
+      if (!mountedRef.current) {
         return;
       }
 
@@ -128,7 +151,7 @@ export default function App() {
       });
 
     return () => {
-      mounted = false;
+      mountedRef.current = false;
       unlisten?.();
     };
   }, []);
@@ -159,16 +182,19 @@ export default function App() {
     setIsRefreshingSnapshot(true);
     void refreshInstallerSnapshot()
       .then((value) => {
+        if (!mountedRef.current) return;
         setSnapshot(value);
         setIsBusy(isBusyStage(value.currentStage));
         setHasInitializationError(false);
       })
       .catch((error: unknown) => {
+        if (!mountedRef.current) return;
         setSnapshot(createInitializationFailureSnapshot(`初始化失败：无法重新检测环境。${toErrorMessage(error)}`));
         setIsBusy(false);
         setHasInitializationError(true);
       })
       .finally(() => {
+        if (!mountedRef.current) return;
         setIsRefreshingSnapshot(false);
       });
   };
