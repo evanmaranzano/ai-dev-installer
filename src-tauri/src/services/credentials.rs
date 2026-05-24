@@ -85,7 +85,7 @@ pub struct WindowsCredentialBackend;
 #[cfg(target_os = "windows")]
 impl SecretBackend for WindowsCredentialBackend {
     fn get(&self, key: &str) -> Result<Option<String>, AppError> {
-        let entry = keyring::Entry::new("MolSpark Desktop", key).map_err(|error| AppError {
+        let entry = keyring::Entry::new("AI Dev Installer", key).map_err(|error| AppError {
             code: "credential_backend_unavailable".to_string(),
             message: "Credential backend is unavailable".to_string(),
             details: Some(error.to_string()),
@@ -103,7 +103,7 @@ impl SecretBackend for WindowsCredentialBackend {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), AppError> {
-        let entry = keyring::Entry::new("MolSpark Desktop", key).map_err(|error| AppError {
+        let entry = keyring::Entry::new("AI Dev Installer", key).map_err(|error| AppError {
             code: "credential_backend_unavailable".to_string(),
             message: "Credential backend is unavailable".to_string(),
             details: Some(error.to_string()),
@@ -117,7 +117,7 @@ impl SecretBackend for WindowsCredentialBackend {
     }
 
     fn delete(&self, key: &str) -> Result<(), AppError> {
-        let entry = keyring::Entry::new("MolSpark Desktop", key).map_err(|error| AppError {
+        let entry = keyring::Entry::new("AI Dev Installer", key).map_err(|error| AppError {
             code: "credential_backend_unavailable".to_string(),
             message: "Credential backend is unavailable".to_string(),
             details: Some(error.to_string()),

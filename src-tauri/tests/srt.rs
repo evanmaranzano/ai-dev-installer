@@ -1,5 +1,5 @@
-use codex_deploy::models::SubtitleSegment;
-use codex_deploy::services::srt::render_srt;
+use ai_dev_installer::models::SubtitleSegment;
+use ai_dev_installer::services::srt::render_srt;
 
 #[test]
 fn renders_srt_with_correct_timestamp_format() {

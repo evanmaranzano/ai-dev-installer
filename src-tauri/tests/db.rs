@@ -1,5 +1,5 @@
-use codex_deploy::storage::db::HistoryDatabase;
-use codex_deploy::storage::history::DEFAULT_SESSION_ID;
+use ai_dev_installer::storage::db::HistoryDatabase;
+use ai_dev_installer::storage::history::DEFAULT_SESSION_ID;
 
 #[test]
 fn inserts_and_reads_chat_history_rows() {

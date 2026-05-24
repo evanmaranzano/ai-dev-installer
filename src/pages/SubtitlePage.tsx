@@ -46,6 +46,10 @@ export function SubtitlePage({
     setIsExtracting(true);
     try {
       setErrorMessage("");
+      if (selectedFile.size > 200 * 1024 * 1024) {
+        setErrorMessage("文件过大（超过 200MB），请选择更小的文件。");
+        return;
+      }
       const data = await readFileBytes(selectedFile);
       const response = await extractSubtitles({
         model: defaultModel,

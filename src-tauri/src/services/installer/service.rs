@@ -563,6 +563,18 @@ impl InstallerService {
         ));
 
         for command in commands {
+            if command.args.first().map(|s| s.as_str()) == Some("config") {
+                if let Some(service) = command.args.get(1) {
+                    if let Some(original) = query_service_start_type(service) {
+                        snapshot.logs.push(build_log_entry(
+                            InstallStageId::InstallCodex,
+                            "info",
+                            format!("{} {}", service, original),
+                        ));
+                    }
+                }
+            }
+
             if let Err(error) = self.run_command_with_timeout(&command, InstallStageId::InstallCodex, Duration::from_secs(30)) {
                 snapshot.logs.push(build_log_entry(
                     InstallStageId::InstallCodex,
@@ -751,48 +763,7 @@ impl InstallerService {
     }
 
     fn run_command(&self, command: &PlannedCommand, stage: InstallStageId) -> Result<(), AppError> {
-        let mut process = Command::new(&command.program);
-        process.args(&command.args);
-        #[cfg(target_os = "windows")]
-        {
-            process.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let output = process.output().map_err(|error| AppError {
-                code: "installer_command_spawn_failed".into(),
-                message: if stage == InstallStageId::InstallCodex && is_winget_command(command) {
-                    "Failed to start winget. Please install or repair Microsoft App Installer, then reopen AI Dev Installer.".into()
-                } else {
-                    format!("Failed to start {}", command.program)
-                },
-                details: Some(if stage == InstallStageId::InstallCodex && is_winget_command(command) {
-                    format!(
-                        "{}. Expected winget.exe from Microsoft App Installer, usually under %LOCALAPPDATA%\\Microsoft\\WindowsApps.",
-                        error
-                    )
-                } else {
-                    error.to_string()
-                }),
-            })?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let combined = if stderr.is_empty() {
-                stdout
-            } else if stdout.is_empty() {
-                stderr
-            } else {
-                format!("{stderr}\n{stdout}")
-            };
-            Err(AppError {
-                code: format!("installer_command_failed_{}", format_stage(&stage)),
-                message: format!("Command failed: {}", command_display(command)),
-                details: Some(combined),
-            })
-        }
+        self.run_command_with_timeout(command, stage, Duration::from_secs(600))
     }
 
     fn run_command_with_timeout(
@@ -815,12 +786,14 @@ impl InstallerService {
         })?;
 
         let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
+                        timed_out = true;
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -838,8 +811,18 @@ impl InstallerService {
             details: Some(error.to_string()),
         })?;
 
-        if output.status.success() {
+        if output.status.success() && !timed_out {
             Ok(())
+        } else if timed_out {
+            Err(AppError {
+                code: format!("installer_command_timeout_{}", format_stage(&stage)),
+                message: format!(
+                    "Command timed out after {}s: {}",
+                    timeout.as_secs(),
+                    command_display(command)
+                ),
+                details: None,
+            })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -986,13 +969,24 @@ pub(super) fn mark_component_skipped_if_installed(
     true
 }
 
-fn is_winget_command(command: &PlannedCommand) -> bool {
-    command
-        .program
-        .rsplit(['\\', '/'])
-        .next()
-        .map(|name| name.eq_ignore_ascii_case("winget") || name.eq_ignore_ascii_case("winget.exe"))
-        .unwrap_or(false)
+#[cfg(target_os = "windows")]
+fn query_service_start_type(service: &str) -> Option<String> {
+    let output = Command::new("sc.exe")
+        .args(["qc", service])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.contains("START_TYPE") {
+            return Some(line.trim().to_string());
+        }
+    }
+    None
 }
 
 fn format_error_details(error: &AppError) -> String {

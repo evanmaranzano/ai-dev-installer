@@ -77,7 +77,7 @@ pub fn microsoft_store_product_page_command() -> PlannedCommand {
 
 pub fn claude_code_install_commands() -> Vec<PlannedCommand> {
     vec![PlannedCommand {
-        program: find_program_on_path("npm").unwrap_or_else(|| "npm".into()),
+        program: find_program_on_path_trusted("npm").unwrap_or_else(|| "npm".into()),
         args: vec![
             "install".into(),
             "-g".into(),
@@ -87,13 +87,11 @@ pub fn claude_code_install_commands() -> Vec<PlannedCommand> {
 }
 
 pub fn winget_program() -> String {
-    find_program_on_path("winget")
-        .or_else(|| {
-            winget_candidate_paths()
-                .into_iter()
-                .find(|path| path.exists())
-                .map(|path| path.display().to_string())
-        })
+    winget_candidate_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .or_else(|| find_program_on_path_trusted("winget"))
         .unwrap_or_else(|| "winget".into())
 }
 
@@ -123,24 +121,6 @@ pub fn winget_candidate_paths() -> Vec<PathBuf> {
     candidates
 }
 
-fn find_program_on_path(program: &str) -> Option<String> {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            for candidate_name in executable_names(program) {
-                let candidate = dir.join(candidate_name);
-                if candidate.exists() {
-                    return Some(candidate.display().to_string());
-                }
-            }
-        }
-    }
-
-    known_program_candidate_paths(program)
-        .into_iter()
-        .find(|path| path.exists())
-        .map(|path| path.display().to_string())
-}
-
 fn executable_names(program: &str) -> Vec<String> {
     let lower = program.to_ascii_lowercase();
     if lower.ends_with(".exe") || lower.ends_with(".cmd") || lower.ends_with(".bat") {
@@ -153,6 +133,50 @@ fn executable_names(program: &str) -> Vec<String> {
             program.to_string(),
         ]
     }
+}
+
+fn is_in_trusted_directory(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+
+    for env in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(dir) = std::env::var(env) {
+            if lower.starts_with(&dir.to_ascii_lowercase()) {
+                return true;
+            }
+        }
+    }
+
+    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+        let lad_lower = lad.to_ascii_lowercase();
+        if lower.starts_with(&*format!("{}\\microsoft\\", lad_lower))
+            || lower.starts_with(&*format!("{}\\programs\\", lad_lower))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn find_program_on_path_trusted(program: &str) -> Option<String> {
+    for path in known_program_candidate_paths(program) {
+        if path.exists() {
+            return Some(path.display().to_string());
+        }
+    }
+
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            for candidate_name in executable_names(program) {
+                let candidate = dir.join(candidate_name);
+                if candidate.exists() && is_in_trusted_directory(&candidate) {
+                    return Some(candidate.display().to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn known_program_candidate_paths(program: &str) -> Vec<PathBuf> {

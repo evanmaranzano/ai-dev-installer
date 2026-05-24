@@ -1,10 +1,10 @@
-use codex_deploy::models::ChatMessage;
-use codex_deploy::services::chat::{ChatRequest, ChatService};
-use codex_deploy::services::gemini::client::{
+use ai_dev_installer::models::ChatMessage;
+use ai_dev_installer::services::chat::{ChatRequest, ChatService};
+use ai_dev_installer::services::gemini::client::{
     GeminiChatClient, GeminiTransport, GeminiTransportRequest, GeminiTransportResponse,
 };
 
-use codex_deploy::error::AppError;
+use ai_dev_installer::error::AppError;
 
 struct FakeGeminiTransport {
     reply_text: String,
@@ -59,12 +59,12 @@ fn sends_model_prompt_history_and_returns_assistant_message() {
             model: "gemini-2.0-flash".to_string(),
             prompt: "你好".to_string(),
             history: vec![ChatMessage {
-                role: codex_deploy::models::ChatRole::User,
+                role: ai_dev_installer::models::ChatRole::User,
                 content: "之前的消息".to_string(),
             }],
         })
         .unwrap();
 
-    assert_eq!(response.message.role, codex_deploy::models::ChatRole::Assistant);
+    assert_eq!(response.message.role, ai_dev_installer::models::ChatRole::Assistant);
     assert_eq!(response.message.content, "hello from gemini");
 }

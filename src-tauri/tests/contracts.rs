@@ -1,5 +1,5 @@
-use codex_deploy::error::AppError;
-use codex_deploy::models::{
+use ai_dev_installer::error::AppError;
+use ai_dev_installer::models::{
     ApiKeyStatus, AppSettings, ChatMessage, ChatRole, ExportArtifact, ExportArtifactKind,
     GeminiModelOption, GeneratedImage, ImageGenerationResponse, SettingsConnectionResult,
     SubtitleSegment, TranscriptResult, WritableAppSettings,

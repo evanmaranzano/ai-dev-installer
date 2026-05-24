@@ -131,7 +131,7 @@ impl HistoryDatabase {
 
 pub fn default_history_db_path() -> PathBuf {
     let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("MolSpark Desktop").join("history.sqlite3")
+    base.join("AI Dev Installer").join("history.sqlite3")
 }
 
 fn chrono_like_timestamp() -> i64 {

@@ -61,6 +61,14 @@ impl SubtitleService {
             });
         }
 
+        if request.data.len() > 200 * 1024 * 1024 {
+            return Err(AppError {
+                code: "file_too_large".to_string(),
+                message: "File exceeds 200MB limit".to_string(),
+                details: Some(format!("{} bytes", request.data.len())),
+            });
+        }
+
         self.client.extract_subtitles(request, &export_dir)
     }
 }

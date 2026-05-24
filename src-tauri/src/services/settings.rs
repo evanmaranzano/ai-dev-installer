@@ -180,7 +180,7 @@ fn default_settings() -> WritableAppSettings {
 
 fn default_settings_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("MolSpark Desktop").join("settings.json")
+    base.join("AI Dev Installer").join("settings.json")
 }
 
 fn temp_settings_path(settings_path: &PathBuf) -> PathBuf {

@@ -1,6 +1,6 @@
-use codex_deploy::error::AppError;
-use codex_deploy::models::{GeneratedImage, ImageGenerationResponse};
-use codex_deploy::services::image::{ImageRequest, ImageService};
+use ai_dev_installer::error::AppError;
+use ai_dev_installer::models::{GeneratedImage, ImageGenerationResponse};
+use ai_dev_installer::services::image::{ImageRequest, ImageService};
 
 struct FakeImageClient {
     response: ImageGenerationResponse,
@@ -12,7 +12,7 @@ impl FakeImageClient {
     }
 }
 
-impl codex_deploy::services::image::GeminiImageClientLike for FakeImageClient {
+impl ai_dev_installer::services::image::GeminiImageClientLike for FakeImageClient {
     fn generate_image(&self, _request: ImageRequest) -> Result<ImageGenerationResponse, AppError> {
         Ok(self.response.clone())
     }

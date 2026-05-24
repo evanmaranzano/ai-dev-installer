@@ -1,8 +1,8 @@
-use codex_deploy::error::AppError;
-use codex_deploy::models::{
+use ai_dev_installer::error::AppError;
+use ai_dev_installer::models::{
     ExportArtifactKind, SubtitleSegment, TranscriptResult,
 };
-use codex_deploy::services::subtitles::{SubtitleExtractionRequest, SubtitleService};
+use ai_dev_installer::services::subtitles::{SubtitleExtractionRequest, SubtitleService};
 
 struct FakeSubtitleClient {
     result: TranscriptResult,
@@ -14,7 +14,7 @@ impl FakeSubtitleClient {
     }
 }
 
-impl codex_deploy::services::subtitles::GeminiSubtitleClientLike for FakeSubtitleClient {
+impl ai_dev_installer::services::subtitles::GeminiSubtitleClientLike for FakeSubtitleClient {
     fn extract_subtitles(
         &self,
         _request: SubtitleExtractionRequest,
@@ -39,7 +39,7 @@ fn returns_transcript_segments_and_artifact_from_fake_client() {
                 text: "世界".to_string(),
             },
         ],
-        artifact: codex_deploy::models::ExportArtifact {
+        artifact: ai_dev_installer::models::ExportArtifact {
             path: "C:/exports/sample.srt".to_string(),
             kind: ExportArtifactKind::Srt,
         },

@@ -1,14 +1,14 @@
 [package]
-name = "codex_deploy"
+name = "ai_dev_installer"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "codex_deploy"
+name = "ai_dev_installer"
 path = "src/lib.rs"
 
 [[bin]]
-name = "codex_deploy"
+name = "ai_dev_installer"
 path = "src/main.rs"
 
 [dependencies]
