@@ -119,6 +119,30 @@ fn saves_and_loads_non_sensitive_app_settings_separately_from_api_key() {
 }
 
 #[test]
+fn rejects_high_risk_default_export_directory_settings() {
+    let settings_path = std::env::temp_dir().join("ai-dev-installer-settings-invalid-export.json");
+    let _ = std::fs::remove_file(&settings_path);
+
+    let service = SettingsService::new(
+        CredentialStore::new(Box::new(MemorySecretBackend::default())),
+        settings_path.clone(),
+        Box::new(FakeGeminiConnectivityClient::success()),
+    );
+
+    let error = service
+        .save_app_settings(WritableAppSettings {
+            default_chat_model: "gemini-2.5-flash".to_string(),
+            default_image_model: "imagen-3".to_string(),
+            default_export_dir: "C:/Windows/System32".to_string(),
+            request_timeout_ms: 15_000,
+        })
+        .expect_err("system export directory should be rejected");
+
+    assert_eq!(error.code, "invalid_export_dir");
+    assert!(!settings_path.exists());
+}
+
+#[test]
 fn tests_api_key_connection_through_injected_client() {
     let settings_path = std::env::temp_dir().join("ai-dev-installer-connection-test.json");
     let _ = std::fs::remove_file(&settings_path);

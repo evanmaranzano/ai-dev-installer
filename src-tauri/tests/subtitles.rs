@@ -2,7 +2,9 @@ use ai_dev_installer::error::AppError;
 use ai_dev_installer::models::{
     ExportArtifactKind, SubtitleSegment, TranscriptResult,
 };
-use ai_dev_installer::services::subtitles::{SubtitleExtractionRequest, SubtitleService};
+use ai_dev_installer::services::subtitles::{
+    validate_export_dir, write_srt_artifact, SubtitleExtractionRequest, SubtitleService,
+};
 
 struct FakeSubtitleClient {
     result: TranscriptResult,
@@ -61,4 +63,52 @@ fn returns_transcript_segments_and_artifact_from_fake_client() {
     assert_eq!(result.segments[0].text, "你好");
     assert_eq!(result.artifact.path, "C:/exports/sample.srt");
     assert_eq!(result.artifact.kind, ExportArtifactKind::Srt);
+}
+
+#[test]
+fn rejects_high_risk_export_directories() {
+    for path in [
+        "",
+        "relative/exports",
+        "C:/",
+        "C:/Windows/System32",
+        "C:/Program Files/AI Dev Installer",
+        "C:/PROGRA~1/AI Dev Installer",
+        "C:/Windows./System32",
+        "C:/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup",
+        "C:/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup.",
+        "C:/Users/Alice/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup",
+        "C:/Users/Alice/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup ",
+        "C:/exports/foo ",
+        " C:/exports/foo",
+        r"\\server\share",
+        r"\\?\C:\exports",
+        "C:/exports/../Windows",
+    ] {
+        let error = validate_export_dir(path).expect_err("path should be rejected");
+        assert_eq!(error.code, "invalid_export_dir");
+    }
+}
+
+#[test]
+fn writes_srt_artifact_to_allowed_export_directory() {
+    let export_dir = std::env::temp_dir().join("ai-dev-installer-subtitles-export-test");
+    let _ = std::fs::remove_dir_all(&export_dir);
+
+    let artifact = write_srt_artifact(
+        &[SubtitleSegment {
+            start_ms: 0,
+            end_ms: 1500,
+            text: "你好".to_string(),
+        }],
+        export_dir.to_str().expect("temp path should be utf8"),
+        "sample.wav",
+    )
+    .unwrap();
+
+    assert_eq!(artifact.kind, ExportArtifactKind::Srt);
+    assert!(artifact.path.ends_with("sample.srt"));
+    assert!(std::path::Path::new(&artifact.path).exists());
+
+    let _ = std::fs::remove_dir_all(&export_dir);
 }

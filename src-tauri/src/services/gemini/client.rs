@@ -1,4 +1,4 @@
-use crate::error::AppError;
+use crate::error::{sanitize_remote_error_details, AppError};
 use crate::models::{
     ChatMessage, ChatResponse, ChatRole, GeneratedImage, ImageGenerationResponse, SubtitleSegment,
     TranscriptResult,
@@ -436,7 +436,7 @@ impl ReqwestGeminiTransport {
             return Err(AppError {
                 code: "gemini_request_failed".to_string(),
                 message: format!("Gemini request failed with HTTP {}", status),
-                details: Some(response_body),
+                details: Some(sanitize_remote_error_details(&response_body)),
             });
         }
 
@@ -505,7 +505,7 @@ impl ReqwestGeminiTransport {
             return Err(AppError {
                 code: "file_upload_failed".to_string(),
                 message: format!("Gemini file upload failed with HTTP {}", status),
-                details: Some(body),
+                details: Some(sanitize_remote_error_details(&body)),
             });
         }
 
@@ -545,7 +545,7 @@ impl ReqwestGeminiTransport {
                 return Err(AppError {
                     code: "file_poll_failed".to_string(),
                     message: format!("Gemini file polling failed with HTTP {}", status),
-                    details: Some(body),
+                    details: Some(sanitize_remote_error_details(&body)),
                 });
             }
 

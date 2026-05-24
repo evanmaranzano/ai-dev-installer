@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::error::AppError;
+use crate::error::{sanitize_remote_error_details, AppError};
 use crate::models::{
     AppSettings, GeminiModelOption, SettingsConnectionResult, WritableAppSettings,
 };
 use crate::services::chat::ChatService;
 use crate::services::credentials::{production_credential_store, CredentialStore};
 use crate::services::image::ImageService;
-use crate::services::subtitles::SubtitleService;
+use crate::services::subtitles::{validate_export_dir, SubtitleService};
 
 const DEFAULT_CHAT_MODEL: &str = "gemini-2.0-flash";
 const DEFAULT_IMAGE_MODEL: &str = "gemini-2.0-flash-preview-image-generation";
@@ -110,7 +110,7 @@ impl GeminiConnectivityClient for ReqwestGeminiConnectivityClient {
                 return Err(AppError {
                     code: "connection_test_failed".to_string(),
                     message: format!("Gemini model list request failed with HTTP {}", status),
-                    details: Some(body),
+                    details: Some(sanitize_remote_error_details(&body)),
                 });
             }
 
@@ -414,6 +414,7 @@ impl SettingsService {
         &self,
         settings: WritableAppSettings,
     ) -> Result<AppSettings, AppError> {
+        validate_export_dir(&settings.default_export_dir)?;
         self.write_writable_settings(&settings)?;
         self.load()
     }

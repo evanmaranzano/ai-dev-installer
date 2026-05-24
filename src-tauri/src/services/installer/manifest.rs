@@ -1,10 +1,13 @@
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
+
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BundledResource {
@@ -37,12 +40,29 @@ impl InstallerManifest {
 }
 
 pub fn verify_sha256(path: &Path, expected_sha256: &str) -> Result<bool, AppError> {
-    let bytes = fs::read(path).map_err(|error| AppError {
+    let mut file = File::open(path).map_err(|error| AppError {
         code: "installer_manifest_read_failed".into(),
         message: "Failed to read bundled installer resource".into(),
         details: Some(error.to_string()),
     })?;
-    let digest = Sha256::digest(bytes);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; HASH_BUFFER_SIZE];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|error| AppError {
+            code: "installer_manifest_read_failed".into(),
+            message: "Failed to read bundled installer resource".into(),
+            details: Some(error.to_string()),
+        })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    let digest = hasher.finalize();
     let actual = hex::encode(digest);
     Ok(actual.eq_ignore_ascii_case(expected_sha256))
 }

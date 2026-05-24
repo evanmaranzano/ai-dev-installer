@@ -1,10 +1,14 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::error::AppError;
 use crate::models::{ExportArtifact, ExportArtifactKind, SubtitleSegment, TranscriptResult};
 use crate::services::gemini::client::GeminiSubtitleClient;
 use crate::services::srt::render_srt;
+
+const WINDOWS_STARTUP_DIR: &str = r"c:\programdata\microsoft\windows\start menu\programs\startup";
+const WINDOWS_USER_STARTUP_SUFFIX: &str =
+    r"\appdata\roaming\microsoft\windows\start menu\programs\startup";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +57,8 @@ impl SubtitleService {
         request: SubtitleExtractionRequest,
         export_dir: String,
     ) -> Result<TranscriptResult, AppError> {
+        validate_export_dir(&export_dir)?;
+
         if request.data.is_empty() {
             return Err(AppError {
                 code: "invalid_file".to_string(),
@@ -73,11 +79,82 @@ impl SubtitleService {
     }
 }
 
+pub fn validate_export_dir(export_dir: &str) -> Result<(), AppError> {
+    let trimmed = export_dir.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_export_dir(export_dir));
+    }
+    if trimmed != export_dir {
+        return Err(invalid_export_dir(export_dir));
+    }
+
+    let normalized = trimmed.replace('/', r"\");
+    let lower = normalized
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+
+    if normalized.starts_with(r"\\") || !Path::new(trimmed).is_absolute() {
+        return Err(invalid_export_dir(export_dir));
+    }
+
+    if has_unsafe_windows_component(&lower) {
+        return Err(invalid_export_dir(export_dir));
+    }
+
+    if Path::new(trimmed)
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(invalid_export_dir(export_dir));
+    }
+
+    if is_drive_root(&lower)
+        || path_has_prefix(&lower, r"c:\windows")
+        || path_has_prefix(&lower, r"c:\program files")
+        || path_has_prefix(&lower, r"c:\program files (x86)")
+        || path_has_prefix(&lower, WINDOWS_STARTUP_DIR)
+        || path_has_suffix_or_child(&lower, WINDOWS_USER_STARTUP_SUFFIX)
+    {
+        return Err(invalid_export_dir(export_dir));
+    }
+
+    Ok(())
+}
+
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!(r"{prefix}\"))
+}
+
+fn path_has_suffix_or_child(path: &str, suffix: &str) -> bool {
+    path.ends_with(suffix) || path.contains(&format!(r"{suffix}\"))
+}
+
+fn has_unsafe_windows_component(path: &str) -> bool {
+    path.split('\\').any(|component| {
+        component.ends_with(['.', ' ']) || matches!(component, "progra~1" | "progra~2")
+    })
+}
+
+fn is_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() == 2 && bytes[1] == b':'
+}
+
+fn invalid_export_dir(export_dir: &str) -> AppError {
+    AppError {
+        code: "invalid_export_dir".to_string(),
+        message: "Export directory is not allowed".to_string(),
+        details: Some(export_dir.to_string()),
+    }
+}
+
 pub fn write_srt_artifact(
     segments: &[SubtitleSegment],
     export_dir: &str,
     file_name: &str,
 ) -> Result<ExportArtifact, AppError> {
+    validate_export_dir(export_dir)?;
+
     fs::create_dir_all(export_dir).map_err(|error| AppError {
         code: "export_write_failed".to_string(),
         message: "Failed to prepare export directory".to_string(),

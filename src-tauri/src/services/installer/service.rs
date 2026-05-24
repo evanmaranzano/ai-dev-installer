@@ -19,7 +19,7 @@ use crate::services::installer::executor::{
     bundled_resource_path, claude_code_install_commands, codex_install_commands, command_display,
     microsoft_store_product_page_command, microsoft_store_product_uri,
     microsoft_store_service_repair_commands, stage_sequence, third_party_install_command,
-    PlannedCommand,
+    windows_system_program, PlannedCommand,
 };
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 
@@ -521,7 +521,8 @@ impl InstallerService {
 
         self.repair_microsoft_store_services(snapshot)?;
 
-        if let Err(store_error) = self.run_commands(&codex_install_commands(), InstallStageId::InstallCodex) {
+        let codex_commands = codex_install_commands()?;
+        if let Err(store_error) = self.run_commands(&codex_commands, InstallStageId::InstallCodex) {
             let _ = self.open_microsoft_store_product_page(snapshot);
             set_component_status(
                 &mut snapshot.components,
@@ -555,7 +556,7 @@ impl InstallerService {
         &self,
         snapshot: &mut InstallerSnapshot,
     ) -> Result<(), AppError> {
-        let commands = microsoft_store_service_repair_commands();
+        let commands = microsoft_store_service_repair_commands()?;
         snapshot.logs.push(build_log_entry(
             InstallStageId::InstallCodex,
             "info",
@@ -595,7 +596,7 @@ impl InstallerService {
         &self,
         snapshot: &mut InstallerSnapshot,
     ) -> Result<(), AppError> {
-        let command = microsoft_store_product_page_command();
+        let command = microsoft_store_product_page_command()?;
         snapshot.logs.push(build_log_entry(
             InstallStageId::InstallCodex,
             "warn",
@@ -639,10 +640,8 @@ impl InstallerService {
         persist_latest_snapshot(snapshot.clone())?;
         emit_snapshot(app, snapshot)?;
 
-        match self.run_commands(
-            &claude_code_install_commands(),
-            InstallStageId::InstallClaudeCode,
-        ) {
+        let claude_code_commands = claude_code_install_commands()?;
+        match self.run_commands(&claude_code_commands, InstallStageId::InstallClaudeCode) {
             Ok(()) => {
                 set_component_status(
                     &mut snapshot.components,
@@ -787,19 +786,20 @@ impl InstallerService {
 
         let deadline = Instant::now() + timeout;
         let mut timed_out = false;
+        let mut cleanup_failure_detail = None;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
+                        cleanup_failure_detail = terminate_child_process_tree(&mut child);
                         timed_out = true;
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(_) => {
-                    let _ = child.kill();
+                    cleanup_failure_detail = terminate_child_process_tree(&mut child);
                     break;
                 }
             }
@@ -821,7 +821,7 @@ impl InstallerService {
                     timeout.as_secs(),
                     command_display(command)
                 ),
-                details: None,
+                details: cleanup_failure_detail,
             })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -886,6 +886,63 @@ fn lock_session_state() -> Result<std::sync::MutexGuard<'static, InstallerSessio
 fn emit_snapshot(app: &AppHandle, snapshot: &InstallerSnapshot) -> Result<(), AppError> {
     app.emit("installer://snapshot", snapshot.clone())
         .map_err(InstallerService::emit_error)
+}
+
+fn terminate_child_process_tree(child: &mut std::process::Child) -> Option<String> {
+    let mut cleanup_failure_detail = None;
+
+    #[cfg(target_os = "windows")]
+    match timeout_process_tree_kill_command(child.id()) {
+        Ok(command) => {
+            let mut process = Command::new(&command.program);
+            process.args(&command.args);
+            process.creation_flags(CREATE_NO_WINDOW);
+            match process.status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    cleanup_failure_detail =
+                        Some(timeout_cleanup_failure_detail(&command, &status.to_string()));
+                }
+                Err(error) => {
+                    cleanup_failure_detail =
+                        Some(timeout_cleanup_failure_detail(&command, &error.to_string()));
+                }
+            }
+        }
+        Err(error) => {
+            cleanup_failure_detail = Some(format!(
+                "Timeout cleanup command could not be created: {}{}",
+                error.message,
+                format_error_details(&error)
+            ));
+        }
+    }
+
+    let _ = child.kill();
+    cleanup_failure_detail
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn timeout_process_tree_kill_command(pid: u32) -> Result<PlannedCommand, AppError> {
+    Ok(PlannedCommand {
+        program: windows_system_program("taskkill.exe")?,
+        args: vec!["/PID".into(), pid.to_string(), "/T".into(), "/F".into()],
+    })
+}
+
+pub(super) fn timeout_cleanup_failure_detail(command: &PlannedCommand, reason: &str) -> String {
+    format!(
+        "Timeout cleanup command failed: {} ({reason})",
+        command_display(command)
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(super) fn timeout_process_tree_kill_command(pid: u32) -> Result<PlannedCommand, AppError> {
+    Ok(PlannedCommand {
+        program: "kill".into(),
+        args: vec!["-TERM".into(), pid.to_string()],
+    })
 }
 
 fn persist_latest_snapshot(snapshot: InstallerSnapshot) -> Result<(), AppError> {
@@ -971,7 +1028,7 @@ pub(super) fn mark_component_skipped_if_installed(
 
 #[cfg(target_os = "windows")]
 fn query_service_start_type(service: &str) -> Option<String> {
-    let output = Command::new("sc.exe")
+    let output = Command::new(windows_system_program("sc.exe").ok()?)
         .args(["qc", service])
         .creation_flags(CREATE_NO_WINDOW)
         .output()

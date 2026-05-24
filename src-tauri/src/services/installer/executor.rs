@@ -25,9 +25,9 @@ pub trait CommandRunner {
     ) -> Result<Vec<InstallerLogEntry>, AppError>;
 }
 
-pub fn codex_install_commands() -> Vec<PlannedCommand> {
-    vec![PlannedCommand {
-        program: winget_program(),
+pub fn codex_install_commands() -> Result<Vec<PlannedCommand>, AppError> {
+    Ok(vec![PlannedCommand {
+        program: winget_program()?,
         args: vec![
             "install".into(),
             "--id".into(),
@@ -38,16 +38,17 @@ pub fn codex_install_commands() -> Vec<PlannedCommand> {
             "--accept-package-agreements".into(),
             "--silent".into(),
         ],
-    }]
+    }])
 }
 
-pub fn microsoft_store_service_repair_commands() -> Vec<PlannedCommand> {
-    ["AppXSvc", "ClipSVC", "InstallService"]
+pub fn microsoft_store_service_repair_commands() -> Result<Vec<PlannedCommand>, AppError> {
+    let sc = windows_system_program("sc.exe")?;
+    Ok(["AppXSvc", "ClipSVC", "InstallService"]
         .into_iter()
         .flat_map(|service| {
             [
                 PlannedCommand {
-                    program: "sc.exe".into(),
+                    program: sc.clone(),
                     args: vec![
                         "config".into(),
                         service.into(),
@@ -56,48 +57,50 @@ pub fn microsoft_store_service_repair_commands() -> Vec<PlannedCommand> {
                     ],
                 },
                 PlannedCommand {
-                    program: "sc.exe".into(),
+                    program: sc.clone(),
                     args: vec!["start".into(), service.into()],
                 },
             ]
         })
-        .collect()
+        .collect())
 }
 
 pub fn microsoft_store_product_uri() -> String {
     format!("ms-windows-store://pdp/?ProductId={CODEX_STORE_PRODUCT_ID}")
 }
 
-pub fn microsoft_store_product_page_command() -> PlannedCommand {
-    PlannedCommand {
-        program: "explorer.exe".into(),
+pub fn microsoft_store_product_page_command() -> Result<PlannedCommand, AppError> {
+    Ok(PlannedCommand {
+        program: windows_system_program("explorer.exe")?,
         args: vec![microsoft_store_product_uri()],
-    }
+    })
 }
 
-pub fn claude_code_install_commands() -> Vec<PlannedCommand> {
-    vec![PlannedCommand {
-        program: find_program_on_path_trusted("npm").unwrap_or_else(|| "npm".into()),
+pub fn claude_code_install_commands() -> Result<Vec<PlannedCommand>, AppError> {
+    Ok(vec![PlannedCommand {
+        program: find_program_on_path_trusted("npm")
+            .ok_or_else(|| trusted_program_missing("npm"))?,
         args: vec![
             "install".into(),
             "-g".into(),
             "@anthropic-ai/claude-code".into(),
         ],
-    }]
+    }])
 }
 
-pub fn winget_program() -> String {
+pub fn winget_program() -> Result<String, AppError> {
     winget_candidate_paths()
         .into_iter()
-        .find(|path| path.exists())
+        .find(|path| path.exists() && is_trusted_winget_path(path))
         .map(|path| path.display().to_string())
         .or_else(|| find_program_on_path_trusted("winget"))
-        .unwrap_or_else(|| "winget".into())
+        .ok_or_else(|| trusted_program_missing("winget"))
 }
 
 pub fn winget_candidate_paths() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
+    #[cfg(test)]
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         candidates.push(
             PathBuf::from(local_app_data)
@@ -107,11 +110,21 @@ pub fn winget_candidate_paths() -> Vec<PathBuf> {
         );
     }
 
+    #[cfg(test)]
     if let Some(user_profile) = std::env::var_os("USERPROFILE") {
         candidates.push(
             PathBuf::from(user_profile)
                 .join("AppData")
                 .join("Local")
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("winget.exe"),
+        );
+    }
+
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        candidates.push(
+            local_app_data
                 .join("Microsoft")
                 .join("WindowsApps")
                 .join("winget.exe"),
@@ -135,32 +148,34 @@ fn executable_names(program: &str) -> Vec<String> {
     }
 }
 
-fn is_in_trusted_directory(path: &Path) -> bool {
-    let lower = path.to_string_lossy().to_ascii_lowercase();
-
-    for env in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
-        if let Ok(dir) = std::env::var(env) {
-            if lower.starts_with(&dir.to_ascii_lowercase()) {
-                return true;
-            }
-        }
-    }
-
-    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
-        let lad_lower = lad.to_ascii_lowercase();
-        if lower.starts_with(&*format!("{}\\microsoft\\", lad_lower))
-            || lower.starts_with(&*format!("{}\\programs\\", lad_lower))
-        {
-            return true;
-        }
-    }
-
-    false
+pub(super) fn is_in_trusted_directory(path: &Path) -> bool {
+    trusted_directory_roots()
+        .into_iter()
+        .any(|root| path_is_inside(&root, path))
 }
 
-fn find_program_on_path_trusted(program: &str) -> Option<String> {
+fn is_trusted_winget_path(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| !name.eq_ignore_ascii_case("winget.exe"))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
+    if is_in_trusted_directory(path) {
+        return true;
+    }
+
+    winget_windows_apps_roots()
+        .into_iter()
+        .any(|root| path_is_inside(&root, path))
+}
+
+pub(super) fn find_program_on_path_trusted(program: &str) -> Option<String> {
     for path in known_program_candidate_paths(program) {
-        if path.exists() {
+        if path.exists() && is_in_trusted_directory(&path) {
             return Some(path.display().to_string());
         }
     }
@@ -194,6 +209,7 @@ fn known_program_candidate_paths(program: &str) -> Vec<PathBuf> {
 }
 
 fn push_base_candidates(candidates: &mut Vec<PathBuf>, relative_paths: &[&str]) {
+    #[cfg(test)]
     for env_name in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
         if let Some(base) = std::env::var_os(env_name) {
             for relative_path in relative_paths {
@@ -223,7 +239,7 @@ pub fn third_party_install_command(
         args.extend(install_args.iter().cloned());
 
         return Ok(PlannedCommand {
-            program: "msiexec.exe".into(),
+            program: windows_system_program("msiexec.exe")?,
             args,
         });
     }
@@ -232,6 +248,88 @@ pub fn third_party_install_command(
         program: normalized,
         args: install_args.to_vec(),
     })
+}
+
+pub(super) fn windows_system_program(program: &str) -> Result<String, AppError> {
+    windows_system_program_candidates(program)
+        .into_iter()
+        .find(|path| path.exists() && is_in_trusted_directory(path))
+        .map(|path| path.display().to_string())
+        .ok_or_else(|| trusted_program_missing(program))
+}
+
+fn windows_system_program_candidates(program: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    #[cfg(test)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        push_windows_program_candidates(&mut candidates, &PathBuf::from(system_root), program);
+    }
+    #[cfg(test)]
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        push_windows_program_candidates(&mut candidates, &PathBuf::from(windir), program);
+    }
+    push_windows_program_candidates(&mut candidates, Path::new(r"C:\Windows"), program);
+
+    candidates
+}
+
+fn push_windows_program_candidates(candidates: &mut Vec<PathBuf>, root: &Path, program: &str) {
+    match program.to_ascii_lowercase().as_str() {
+        "explorer.exe" => candidates.push(root.join(program)),
+        _ => candidates.push(root.join("System32").join(program)),
+    }
+}
+
+fn trusted_directory_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for root in [r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)"] {
+        roots.push(PathBuf::from(root));
+    }
+
+    #[cfg(test)]
+    for env in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(dir) = std::env::var_os(env) {
+            roots.push(PathBuf::from(dir));
+        }
+    }
+
+    roots
+}
+
+fn winget_windows_apps_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    #[cfg(test)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local_app_data).join("Microsoft").join("WindowsApps"));
+    }
+
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        roots.push(local_app_data.join("Microsoft").join("WindowsApps"));
+    }
+
+    roots
+}
+
+fn path_is_inside(root: &Path, path: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+
+    path.starts_with(root)
+}
+
+fn trusted_program_missing(program: &str) -> AppError {
+    AppError {
+        code: "installer_trusted_program_missing".into(),
+        message: format!("Trusted installer program not found: {program}"),
+        details: None,
+    }
 }
 
 pub fn bundled_resource_path(file_name: &str, resource_root: &Path) -> Result<PathBuf, AppError> {

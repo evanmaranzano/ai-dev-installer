@@ -4,14 +4,15 @@ use crate::services::installer::environment::{
 };
 use crate::services::installer::executor::{
     claude_code_install_commands, codex_install_commands, command_display,
-    microsoft_store_product_page_command, microsoft_store_product_uri,
-    microsoft_store_service_repair_commands, stage_sequence, third_party_install_command,
-    winget_candidate_paths,
+    find_program_on_path_trusted, is_in_trusted_directory, microsoft_store_product_page_command,
+    microsoft_store_product_uri, microsoft_store_service_repair_commands, stage_sequence,
+    third_party_install_command, winget_candidate_paths,
 };
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 use crate::services::installer::service::{
     codex_store_install_failure_error, component_status, mark_component_skipped_if_installed,
-    InstallerService, InstallerSessionState,
+    timeout_cleanup_failure_detail, timeout_process_tree_kill_command, InstallerService,
+    InstallerSessionState,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -280,17 +281,49 @@ fn verifies_sha256_for_temp_file_contents() {
 }
 
 #[test]
+fn verifies_sha256_for_payload_larger_than_hash_buffer() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_path = std::env::temp_dir().join(format!("installer-manifest-large-{unique}.bin"));
+    let payload = vec![b'a'; 70 * 1024];
+    fs::write(&temp_path, &payload).expect("large temp file should be written");
+
+    let expected = hex::encode(Sha256::digest(&payload));
+    let verified = verify_sha256(&temp_path, &expected).expect("hash verification should work");
+
+    assert!(verified);
+
+    fs::remove_file(temp_path).expect("large temp file should be removed");
+}
+
+#[test]
 fn plans_codex_install_with_msstore_winget_product_id() {
-    let commands = codex_install_commands();
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-winget-{unique}"));
+    let winget_path = temp_root
+        .join("Microsoft")
+        .join("WindowsApps")
+        .join("winget.exe");
+
+    fs::create_dir_all(winget_path.parent().unwrap()).expect("fake winget dir should be created");
+    fs::write(&winget_path, b"fake winget").expect("fake winget should be written");
+
+    let original_local_app_data = std::env::var_os("LOCALAPPDATA");
+    std::env::set_var("LOCALAPPDATA", &temp_root);
+
+    let commands = codex_install_commands().expect("codex command should build");
+
+    restore_env_var("LOCALAPPDATA", original_local_app_data);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
 
     assert_eq!(commands.len(), 1);
-    assert!(
-        commands[0].program.eq_ignore_ascii_case("winget")
-            || commands[0]
-                .program
-                .to_ascii_lowercase()
-                .ends_with("winget.exe")
-    );
+    assert_eq!(commands[0].program, winget_path.display().to_string());
     assert_eq!(
         commands[0].args,
         vec![
@@ -308,24 +341,44 @@ fn plans_codex_install_with_msstore_winget_product_id() {
 
 #[test]
 fn plans_microsoft_store_service_repair_before_codex_install() {
-    let commands = microsoft_store_service_repair_commands();
+    let commands =
+        microsoft_store_service_repair_commands().expect("store repair commands should build");
     let command_lines: Vec<String> = commands.iter().map(command_display).collect();
 
     assert_eq!(commands.len(), 6);
-    assert!(command_lines.contains(&"sc.exe config AppXSvc start= demand".to_string()));
-    assert!(command_lines.contains(&"sc.exe start AppXSvc".to_string()));
-    assert!(command_lines.contains(&"sc.exe config ClipSVC start= demand".to_string()));
-    assert!(command_lines.contains(&"sc.exe start ClipSVC".to_string()));
-    assert!(command_lines.contains(&"sc.exe config InstallService start= demand".to_string()));
-    assert!(command_lines.contains(&"sc.exe start InstallService".to_string()));
+    assert!(commands
+        .iter()
+        .all(|command| command.program.to_ascii_lowercase().ends_with("sc.exe")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe config AppXSvc start= demand")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe start AppXSvc")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe config ClipSVC start= demand")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe start ClipSVC")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe config InstallService start= demand")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe start InstallService")));
 }
 
 #[test]
 fn plans_microsoft_store_product_page_wakeup_for_codex() {
-    let command = microsoft_store_product_page_command();
+    let command =
+        microsoft_store_product_page_command().expect("store page command should build");
 
     assert_eq!(microsoft_store_product_uri(), "ms-windows-store://pdp/?ProductId=9PLM9XGG6VKS");
-    assert_eq!(command.program, "explorer.exe");
+    assert!(command
+        .program
+        .to_ascii_lowercase()
+        .ends_with("explorer.exe"));
     assert_eq!(command.args, vec![microsoft_store_product_uri()]);
 }
 
@@ -350,24 +403,30 @@ fn codex_store_failure_error_mentions_service_repair_and_store_wakeup() {
 
 #[test]
 fn plans_claude_code_install_with_official_npm_package() {
-    let commands = claude_code_install_commands();
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-official-npm-{unique}"));
+    let npm_path = temp_root.join("nodejs").join("npm.cmd");
+
+    fs::create_dir_all(npm_path.parent().unwrap()).expect("fake npm dir should be created");
+    fs::write(&npm_path, b"@echo off\r\n").expect("fake npm should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_program_files = std::env::var_os("ProgramFiles");
+    std::env::set_var("PATH", "");
+    std::env::set_var("ProgramFiles", &temp_root);
+
+    let commands = claude_code_install_commands().expect("claude command should build");
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("ProgramFiles", original_program_files);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
 
     assert_eq!(commands.len(), 1);
-    assert!(
-        commands[0].program.eq_ignore_ascii_case("npm")
-            || commands[0]
-                .program
-                .to_ascii_lowercase()
-                .ends_with("npm.cmd")
-            || commands[0]
-                .program
-                .to_ascii_lowercase()
-                .ends_with("npm.bat")
-            || commands[0]
-                .program
-                .to_ascii_lowercase()
-                .ends_with("npm.exe")
-    );
+    assert_eq!(commands[0].program, npm_path.display().to_string());
     assert_eq!(
         commands[0].args,
         vec![
@@ -397,13 +456,127 @@ fn plans_claude_code_install_with_refreshed_program_files_path() {
     std::env::set_var("PATH", "");
     std::env::set_var("ProgramFiles", &temp_root);
 
-    let commands = claude_code_install_commands();
+    let commands = claude_code_install_commands().expect("claude command should build");
 
     restore_env_var("PATH", original_path);
     restore_env_var("ProgramFiles", original_program_files);
     fs::remove_dir_all(&temp_root).expect("fake program files dir should be removed");
 
     assert_eq!(commands[0].program, npm_path.display().to_string());
+}
+
+#[test]
+fn rejects_executable_path_that_only_prefix_matches_trusted_directory() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-trusted-prefix-{unique}"));
+    let trusted_root = temp_root.join("Program Files");
+    let spoofed_root = temp_root.join("Program Files Evil");
+    let spoofed_npm = spoofed_root.join("nodejs").join("npm.cmd");
+
+    fs::create_dir_all(&trusted_root).expect("trusted root should be created");
+    fs::create_dir_all(spoofed_npm.parent().unwrap()).expect("spoofed dir should be created");
+    fs::write(&spoofed_npm, b"@echo off\r\n").expect("spoofed npm should be written");
+
+    let original_program_files = std::env::var_os("ProgramFiles");
+    std::env::set_var("ProgramFiles", &trusted_root);
+
+    let trusted = is_in_trusted_directory(&spoofed_npm);
+
+    restore_env_var("ProgramFiles", original_program_files);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert!(!trusted);
+}
+
+#[test]
+fn does_not_fall_back_to_unqualified_program_from_untrusted_path() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-untrusted-program-{unique}"));
+    let untrusted_dir = temp_root.join("bin");
+    let untrusted_program = untrusted_dir.join("untrusted-tool.cmd");
+
+    fs::create_dir_all(&untrusted_dir).expect("untrusted dir should be created");
+    fs::write(&untrusted_program, b"@echo off\r\n").expect("untrusted program should be written");
+
+    let original_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &untrusted_dir);
+
+    let found = find_program_on_path_trusted("untrusted-tool");
+
+    restore_env_var("PATH", original_path);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert_eq!(found, None);
+}
+
+#[test]
+fn does_not_trust_path_candidate_from_local_app_data_microsoft_directory() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-localappdata-path-{unique}"));
+    let microsoft_dir = temp_root.join("Microsoft").join("spoof");
+    let spoofed_tool = microsoft_dir.join("localapp-spoof.cmd");
+
+    fs::create_dir_all(&microsoft_dir).expect("spoofed microsoft dir should be created");
+    fs::write(&spoofed_tool, b"@echo off\r\n").expect("spoofed tool should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_local_app_data = std::env::var_os("LOCALAPPDATA");
+    std::env::set_var("PATH", &microsoft_dir);
+    std::env::set_var("LOCALAPPDATA", &temp_root);
+
+    let found = find_program_on_path_trusted("localapp-spoof");
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("LOCALAPPDATA", original_local_app_data);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert_eq!(found, None);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn timeout_cleanup_targets_the_child_process_tree() {
+    let command = timeout_process_tree_kill_command(1234)
+        .expect("taskkill cleanup command should be available");
+
+    assert!(command
+        .program
+        .to_ascii_lowercase()
+        .ends_with("taskkill.exe"));
+    assert_eq!(
+        command.args,
+        vec![
+            "/PID".to_string(),
+            "1234".to_string(),
+            "/T".to_string(),
+            "/F".to_string()
+        ]
+    );
+}
+
+#[test]
+fn timeout_cleanup_failure_detail_includes_cleanup_command_and_reason() {
+    let command = crate::services::installer::executor::PlannedCommand {
+        program: "taskkill.exe".to_string(),
+        args: vec!["/PID".to_string(), "1234".to_string(), "/T".to_string(), "/F".to_string()],
+    };
+
+    let detail = timeout_cleanup_failure_detail(&command, "exit code 128");
+
+    assert!(detail.contains("taskkill.exe /PID 1234 /T /F"));
+    assert!(detail.contains("exit code 128"));
 }
 
 #[test]
@@ -444,7 +617,10 @@ fn plans_msi_and_exe_install_commands_from_third_party_manifest_entries() {
     )
     .expect("python command should build");
 
-    assert_eq!(msi_command.program, "msiexec.exe");
+    assert!(msi_command
+        .program
+        .to_ascii_lowercase()
+        .ends_with("msiexec.exe"));
     assert_eq!(
         msi_command.args,
         vec![
@@ -460,7 +636,8 @@ fn plans_msi_and_exe_install_commands_from_third_party_manifest_entries() {
     assert_eq!(
         command_display(&msi_command),
         format!(
-            "msiexec.exe /i {} /qn /norestart",
+            "{} /i {} /qn /norestart",
+            msi_command.program,
             Path::new("C:/bundle/resources/third_party")
                 .join("node/node-v24.15.0-x64.msi")
                 .display()
@@ -506,7 +683,10 @@ fn strips_windows_extended_path_prefix_for_msi_installs() {
     )
     .expect("msi command should build from extended-length path");
 
-    assert_eq!(command.program, "msiexec.exe");
+    assert!(command
+        .program
+        .to_ascii_lowercase()
+        .ends_with("msiexec.exe"));
     assert_eq!(
         command.args,
         vec![

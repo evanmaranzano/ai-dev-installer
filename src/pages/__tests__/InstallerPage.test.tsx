@@ -207,3 +207,39 @@ test("disables install and retry actions while snapshot refresh is running", () 
   expect(screen.getByRole("button", { name: "重试当前阶段" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "重新执行全部安装" })).toBeDisabled();
 });
+
+test("renders only the latest 200 installer log entries", () => {
+  const logs = Array.from({ length: 250 }, (_, index) => ({
+    timestamp: "10:00:00",
+    stage: "preflight" as const,
+    level: "info" as const,
+    message: `log ${index + 1}`
+  }));
+
+  render(
+    <InstallerPage
+      snapshot={{
+        currentStage: "preflight",
+        progressPercent: 10,
+        components: [],
+        logs,
+        lastError: null
+      }}
+      isBusy={false}
+      hasInitializationError={false}
+      isRefreshingSnapshot={false}
+      onInstallCodex={vi.fn()}
+      onInstallClaudeCode={vi.fn()}
+      onInstallAll={vi.fn()}
+      onRefreshSnapshot={vi.fn()}
+      onRetryStage={vi.fn()}
+      onRetryAll={vi.fn()}
+    />
+  );
+
+  expect(screen.getByText("已隐藏较早的 50 条日志。")).toBeInTheDocument();
+  expect(screen.queryByText("log 50")).not.toBeInTheDocument();
+  expect(screen.getByText("log 51")).toBeInTheDocument();
+  expect(screen.getByText("log 250")).toBeInTheDocument();
+  expect(screen.getAllByText("INFO")).toHaveLength(200);
+});

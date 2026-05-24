@@ -25,6 +25,8 @@ const EMPTY_SNAPSHOT: InstallerSnapshot = {
   lastError: null
 };
 
+const BUSY_POLL_INTERVAL_MS = 15_000;
+
 function isBusyStage(stage: InstallerSnapshot["currentStage"]) {
   return !["idle", "completed", "failed"].includes(stage);
 }
@@ -171,7 +173,7 @@ export default function App() {
         .catch(() => {
           // Ignore transient polling failures while the installer flow is still running.
         });
-    }, 3000);
+    }, BUSY_POLL_INTERVAL_MS);
 
     return () => {
       window.clearInterval(timer);
