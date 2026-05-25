@@ -109,6 +109,7 @@ export default function App() {
   const [hasInitializationError, setHasInitializationError] = useState(false);
   const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
   const mountedRef = useRef(true);
+  const pendingInstallerActionRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -202,6 +203,11 @@ export default function App() {
   };
 
   const handleFlowStart = (flow: "install_codex" | "install_claude_code" | "install_all") => {
+    if (pendingInstallerActionRef.current || isBusy || hasInitializationError) {
+      return;
+    }
+    pendingInstallerActionRef.current = true;
+
     const queuedMessage =
       flow === "install_all"
         ? "已提交全部安装请求，正在准备安装环境..."
@@ -213,78 +219,100 @@ export default function App() {
     setIsBusy(true);
     setHasInitializationError(false);
 
-    void startInstallFlow(flow).catch((error: unknown) => {
-      const message = `启动安装失败：${toErrorMessage(error)}`;
-      setSnapshot((current) => ({
-        ...current,
-        currentStage: "failed",
-        lastError: message,
-        logs: [
-          ...current.logs,
-          {
-            timestamp: buildTimestamp(),
-            stage: "failed",
-            level: "error",
-            message
-          }
-        ]
-      }));
-      setIsBusy(false);
-    });
+    void startInstallFlow(flow)
+      .catch((error: unknown) => {
+        const message = `启动安装失败：${toErrorMessage(error)}`;
+        setSnapshot((current) => ({
+          ...current,
+          currentStage: "failed",
+          lastError: message,
+          logs: [
+            ...current.logs,
+            {
+              timestamp: buildTimestamp(),
+              stage: "failed",
+              level: "error",
+              message
+            }
+          ]
+        }));
+        setIsBusy(false);
+      })
+      .finally(() => {
+        pendingInstallerActionRef.current = false;
+      });
   };
 
   const handleRetryCurrentStage = () => {
+    if (pendingInstallerActionRef.current || isBusy || snapshot.currentStage !== "failed") {
+      return;
+    }
+    pendingInstallerActionRef.current = true;
+
     setSnapshot((current) =>
       createQueuedFlowSnapshot(current, "已提交重试请求，正在重新进入当前阶段...")
     );
     setIsBusy(true);
     setHasInitializationError(false);
 
-    void retryCurrentStage().catch((error: unknown) => {
-      const message = `重试当前阶段失败：${toErrorMessage(error)}`;
-      setSnapshot((current) => ({
-        ...current,
-        currentStage: "failed",
-        lastError: message,
-        logs: [
-          ...current.logs,
-          {
-            timestamp: buildTimestamp(),
-            stage: "failed",
-            level: "error",
-            message
-          }
-        ]
-      }));
-      setIsBusy(false);
-    });
+    void retryCurrentStage()
+      .catch((error: unknown) => {
+        const message = `重试当前阶段失败：${toErrorMessage(error)}`;
+        setSnapshot((current) => ({
+          ...current,
+          currentStage: "failed",
+          lastError: message,
+          logs: [
+            ...current.logs,
+            {
+              timestamp: buildTimestamp(),
+              stage: "failed",
+              level: "error",
+              message
+            }
+          ]
+        }));
+        setIsBusy(false);
+      })
+      .finally(() => {
+        pendingInstallerActionRef.current = false;
+      });
   };
 
   const handleRetryAll = () => {
+    if (pendingInstallerActionRef.current || isBusy || snapshot.currentStage !== "failed") {
+      return;
+    }
+    pendingInstallerActionRef.current = true;
+
     setSnapshot((current) =>
       createQueuedFlowSnapshot(current, "已提交全部重试请求，正在重新准备安装流程...")
     );
     setIsBusy(true);
     setHasInitializationError(false);
 
-    void retryInstallAll().catch((error: unknown) => {
-      const message = `重新执行全部安装失败：${toErrorMessage(error)}`;
-      setSnapshot((current) => ({
-        ...current,
-        currentStage: "failed",
-        lastError: message,
-        logs: [
-          ...current.logs,
-          {
-            timestamp: buildTimestamp(),
-            stage: "failed",
-            level: "error",
-            message
-          }
-        ]
-      }));
-      setIsBusy(false);
-    });
+    void retryInstallAll()
+      .catch((error: unknown) => {
+        const message = `重新执行全部安装失败：${toErrorMessage(error)}`;
+        setSnapshot((current) => ({
+          ...current,
+          currentStage: "failed",
+          lastError: message,
+          logs: [
+            ...current.logs,
+            {
+              timestamp: buildTimestamp(),
+              stage: "failed",
+              level: "error",
+              message
+            }
+          ]
+        }));
+        setIsBusy(false);
+      })
+      .finally(() => {
+        pendingInstallerActionRef.current = false;
+      });
   };
 
   return (

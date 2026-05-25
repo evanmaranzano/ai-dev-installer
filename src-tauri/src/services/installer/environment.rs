@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::models::installer::{
     InstallStageId, InstallerComponentState, InstallerComponentStatus, InstallerSnapshot,
 };
+use crate::services::installer::executor::{find_program_on_path_trusted, is_in_trusted_directory};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -46,17 +47,9 @@ impl DetectExecutionEnvironment {
     }
 
     fn detect_path(&self, command: &str) -> Option<String> {
-        let output = self.command_output("where", &[command]).ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        String::from_utf8(output.stdout)
-            .ok()?
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(|line| line.to_string())
+        detect_known_binary_path(command)
+            .or_else(|| find_program_on_path_trusted(command).map(PathBuf::from))
+            .map(|path| path.display().to_string())
     }
 
     fn detect_version(&self, command: &str) -> Option<String> {
@@ -75,25 +68,14 @@ impl DetectExecutionEnvironment {
             std::path::PathBuf::from(r"C:\Program Files\Python313\python.exe"),
         ];
 
-        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-            candidates.push(
-                std::path::PathBuf::from(&base)
-                    .join("Programs")
-                    .join("Python")
-                    .join("Python312")
-                    .join("python.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(base)
-                    .join("Programs")
-                    .join("Python")
-                    .join("Python313")
-                    .join("python.exe"),
-            );
+        // Per-user Python installs go to LOCALAPPDATA
+        if let Some(local) = dirs::data_local_dir() {
+            candidates.push(local.join(r"Programs\Python\Python312\python.exe"));
+            candidates.push(local.join(r"Programs\Python\Python313\python.exe"));
         }
 
         for candidate in candidates {
-            if candidate.exists() {
+            if candidate.exists() && is_trusted_detected_binary_path(&candidate) {
                 let version = candidate
                     .to_str()
                     .and_then(|path| self.command_output(path, &["--version"]).ok())
@@ -114,7 +96,10 @@ impl DetectExecutionEnvironment {
             "(Get-AppxPackage -Name '{package_name}' -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {{ \"{{0}}|{{1}}\" -f $_.Version, $_.InstallLocation }})"
         );
         let output = self
-            .command_output("powershell.exe", &["-NoProfile", "-Command", &script])
+            .command_output(
+                windows_system_tool_path("powershell.exe"),
+                &["-NoProfile", "-Command", &script],
+            )
             .ok()?;
         if !output.status.success() {
             return None;
@@ -142,7 +127,11 @@ impl DetectExecutionEnvironment {
         })
     }
 
-    fn command_output(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    fn command_output(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output> {
         let mut command = Command::new(program);
         command.args(args);
         if let Some(path) = self.refreshed_path_env() {
@@ -181,7 +170,7 @@ impl Default for DetectExecutionEnvironment {
 
 impl EnvironmentProbe for DetectExecutionEnvironment {
     fn is_admin(&self) -> bool {
-        self.command_output("net", &["session"])
+        self.command_output(windows_system_tool_path("net.exe"), &["session"])
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
@@ -283,6 +272,10 @@ fn detect_cc_switch_local_install() -> Option<DetectedBinary> {
         })
         .filter(|path| path.exists())?;
 
+    if !is_trusted_detected_binary_path(&path) {
+        return None;
+    }
+
     Some(DetectedBinary {
         version: None,
         path: Some(path.display().to_string()),
@@ -327,6 +320,27 @@ fn claude_code_component_from_detection(probe: &dyn EnvironmentProbe) -> Install
                 detail: found.path.unwrap_or_else(|| "已检测到命令".into()),
                 version: found.version,
             };
+        }
+    }
+
+    // Also check npm global bin directory (%APPDATA%\npm) since npm install -g
+    // may place claude.cmd outside the trusted path set.
+    if let Some(npm_global_bin) = std::env::var_os("APPDATA").map(|p| {
+        let mut path = std::path::PathBuf::from(p);
+        path.push("npm");
+        path
+    }) {
+        for name in ["claude.cmd", "claude.exe"] {
+            let candidate = npm_global_bin.join(name);
+            if candidate.exists() {
+                return InstallerComponentState {
+                    id: "claude_code".into(),
+                    label: "Claude Code".into(),
+                    status: InstallerComponentStatus::Installed,
+                    detail: candidate.display().to_string(),
+                    version: None,
+                };
+            }
         }
     }
 
@@ -417,7 +431,7 @@ fn component_id(label: &str) -> String {
 fn detect_known_binary_path(command: &str) -> Option<PathBuf> {
     known_binary_candidates(command)
         .into_iter()
-        .find(|path| path.exists())
+        .find(|path| path.exists() && is_trusted_detected_binary_path(path))
 }
 
 fn known_binary_candidates(command: &str) -> Vec<PathBuf> {
@@ -426,7 +440,10 @@ fn known_binary_candidates(command: &str) -> Vec<PathBuf> {
 
     match normalized.as_str() {
         "git" | "git.exe" => {
-            push_program_files_candidates(&mut candidates, &[r"Git\cmd\git.exe", r"Git\bin\git.exe"]);
+            push_program_files_candidates(
+                &mut candidates,
+                &[r"Git\cmd\git.exe", r"Git\bin\git.exe"],
+            );
         }
         "node" | "node.exe" => {
             push_program_files_candidates(&mut candidates, &[r"nodejs\node.exe"]);
@@ -441,17 +458,21 @@ fn known_binary_candidates(command: &str) -> Vec<PathBuf> {
 }
 
 fn push_program_files_candidates(candidates: &mut Vec<PathBuf>, relative_paths: &[&str]) {
-    for env_name in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-        if let Some(base) = std::env::var_os(env_name) {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT") {
+        for base in std::env::split_paths(&root) {
             for relative_path in relative_paths {
-                candidates.push(PathBuf::from(&base).join(relative_path));
+                candidates.push(base.join(relative_path));
             }
         }
     }
 
-    for base in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+    for base in [
+        PathBuf::from(r"C:\Program Files"),
+        PathBuf::from(r"C:\Program Files (x86)"),
+    ] {
         for relative_path in relative_paths {
-            candidates.push(Path::new(base).join(relative_path));
+            candidates.push(base.join(relative_path));
         }
     }
 }
@@ -460,12 +481,12 @@ fn refreshed_path_env() -> Option<OsString> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
-    append_path_entries(std::env::var_os("PATH"), &mut entries, &mut seen);
+    append_path_entries(std::env::var_os("PATH"), true, &mut entries, &mut seen);
 
     #[cfg(target_os = "windows")]
     {
-        for value in registry_path_values() {
-            append_path_entries(Some(value), &mut entries, &mut seen);
+        for (value, trusted_only) in registry_path_values() {
+            append_path_entries(Some(value), trusted_only, &mut entries, &mut seen);
         }
         for path in known_path_entries() {
             push_unique_path(path, &mut entries, &mut seen);
@@ -477,6 +498,7 @@ fn refreshed_path_env() -> Option<OsString> {
 
 fn append_path_entries(
     value: Option<OsString>,
+    trusted_only: bool,
     entries: &mut Vec<PathBuf>,
     seen: &mut HashSet<String>,
 ) {
@@ -485,6 +507,9 @@ fn append_path_entries(
     };
 
     for path in std::env::split_paths(&value) {
+        if trusted_only && !is_trusted_detected_binary_path(&path) {
+            continue;
+        }
         push_unique_path(path, entries, seen);
     }
 }
@@ -500,20 +525,34 @@ fn push_unique_path(path: PathBuf, entries: &mut Vec<PathBuf>, seen: &mut HashSe
     }
 }
 
+fn is_trusted_detected_binary_path(path: &Path) -> bool {
+    is_in_trusted_directory(path)
+}
+
 #[cfg(target_os = "windows")]
-fn registry_path_values() -> Vec<OsString> {
+fn registry_path_values() -> Vec<(OsString, bool)> {
     [
-        (r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "Path"),
-        (r"HKCU\Environment", "Path"),
+        (
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "Path",
+            true,
+        ),
+        (r"HKCU\Environment", "Path", true),
     ]
     .into_iter()
-    .filter_map(|(key, value)| read_registry_value(key, value))
+    .filter_map(|(key, value, trusted_only)| {
+        read_registry_value(key, value).map(|path| (path, trusted_only))
+    })
     .collect()
 }
 
 #[cfg(target_os = "windows")]
 fn read_registry_value(key: &str, value: &str) -> Option<OsString> {
-    let output = command_output_without_refreshed_path("reg.exe", &["query", key, "/v", value]).ok()?;
+    let output = command_output_without_refreshed_path(
+        windows_system_tool_path("reg.exe"),
+        &["query", key, "/v", value],
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -579,6 +618,21 @@ fn command_output_without_refreshed_path(
     command.args(args);
     command.creation_flags(CREATE_NO_WINDOW);
     command.output()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_system_tool_path(program: &str) -> &str {
+    match program.to_ascii_lowercase().as_str() {
+        "powershell.exe" => r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "reg.exe" => r"C:\Windows\System32\reg.exe",
+        "net.exe" => r"C:\Windows\System32\net.exe",
+        _ => program,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_system_tool_path(program: &str) -> &str {
+    program
 }
 
 fn first_non_empty_output_line(output: std::process::Output) -> Option<String> {

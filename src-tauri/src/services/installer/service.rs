@@ -25,6 +25,7 @@ use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 
 static INSTALLER_SESSION_STATE: OnceLock<Mutex<InstallerSessionState>> = OnceLock::new();
 static INSTALLER_FLOW_RUNNING: AtomicBool = AtomicBool::new(false);
+const MAX_INSTALLER_COMMAND_OUTPUT_CHARS: usize = 2048;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -312,7 +313,10 @@ impl InstallerService {
     pub fn stage_sequence_for(&self, flow: &str) -> Result<Vec<String>, AppError> {
         let stages = stage_sequence(flow);
         validate_stages(flow, &stages)?;
-        Ok(stages.into_iter().map(|stage| format!("{stage:?}")).collect())
+        Ok(stages
+            .into_iter()
+            .map(|stage| format!("{stage:?}"))
+            .collect())
     }
 
     async fn execute_stage(
@@ -576,7 +580,11 @@ impl InstallerService {
                 }
             }
 
-            if let Err(error) = self.run_command_with_timeout(&command, InstallStageId::InstallCodex, Duration::from_secs(30)) {
+            if let Err(error) = self.run_command_with_timeout(
+                &command,
+                InstallStageId::InstallCodex,
+                Duration::from_secs(30),
+            ) {
                 snapshot.logs.push(build_log_entry(
                     InstallStageId::InstallCodex,
                     "warn",
@@ -600,7 +608,10 @@ impl InstallerService {
         snapshot.logs.push(build_log_entry(
             InstallStageId::InstallCodex,
             "warn",
-            format!("winget 安装失败，正在尝试打开 Microsoft Store 页面：{}", microsoft_store_product_uri()),
+            format!(
+                "winget 安装失败，正在尝试打开 Microsoft Store 页面：{}",
+                microsoft_store_product_uri()
+            ),
         ));
         self.run_command(&command, InstallStageId::InstallCodex)
     }
@@ -664,11 +675,15 @@ impl InstallerService {
                     "error",
                     format!("Claude Code 安装失败：{}", error.message),
                 ));
-                if let Some(details) = error.details.as_ref().filter(|value| !value.trim().is_empty()) {
+                if let Some(details) = error
+                    .details
+                    .as_ref()
+                    .and_then(|value| sanitize_installer_command_output(value))
+                {
                     snapshot.logs.push(build_log_entry(
                         InstallStageId::InstallClaudeCode,
                         "error",
-                        details.clone(),
+                        details,
                     ));
                 }
                 persist_latest_snapshot(snapshot.clone())?;
@@ -695,7 +710,14 @@ impl InstallerService {
         let required_components: &[&str] = match flow {
             "install_codex" => &["git", "python", "nodejs", "cc_switch", "codex"],
             "install_claude_code" => &["git", "python", "nodejs", "cc_switch", "claude_code"],
-            "install_all" => &["git", "python", "nodejs", "cc_switch", "codex", "claude_code"],
+            "install_all" => &[
+                "git",
+                "python",
+                "nodejs",
+                "cc_switch",
+                "codex",
+                "claude_code",
+            ],
             _ => &["git", "python", "nodejs", "cc_switch", "codex"],
         };
 
@@ -729,14 +751,8 @@ impl InstallerService {
     }
 
     fn load_bundled_manifest(&self, app: &AppHandle) -> Result<InstallerManifest, AppError> {
-        let root = self.resource_root(app)?;
-        let manifest_path = root.join("manifest.json");
-        let json = std::fs::read_to_string(&manifest_path).map_err(|error| AppError {
-            code: "installer_manifest_read_failed".into(),
-            message: "Failed to read bundled installer manifest".into(),
-            details: Some(format!("{} ({error})", manifest_path.display())),
-        })?;
-        InstallerManifest::from_json_str(&json)
+        let _ = app;
+        InstallerManifest::bundled()
     }
 
     fn resource_root(&self, app: &AppHandle) -> Result<PathBuf, AppError> {
@@ -824,19 +840,11 @@ impl InstallerService {
                 details: cleanup_failure_detail,
             })
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let combined = if stderr.is_empty() {
-                stdout
-            } else if stdout.is_empty() {
-                stderr
-            } else {
-                format!("{stderr}\n{stdout}")
-            };
+            let combined = combined_command_output(&output.stdout, &output.stderr);
             Err(AppError {
                 code: format!("installer_command_failed_{}", format_stage(&stage)),
                 message: format!("Command failed: {}", command_display(command)),
-                details: Some(combined),
+                details: sanitize_installer_command_output(&combined),
             })
         }
     }
@@ -848,6 +856,182 @@ impl InstallerService {
             details: Some(error.to_string()),
         }
     }
+}
+
+fn combined_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+
+    if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stderr}\n{stdout}")
+    }
+}
+
+pub(super) fn sanitize_installer_command_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(truncate_chars(
+        &redact_sensitive_installer_output(trimmed),
+        MAX_INSTALLER_COMMAND_OUTPUT_CHARS,
+    ))
+}
+
+fn redact_sensitive_installer_output(input: &str) -> String {
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    let mut redacted = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+
+        if looks_like_url_with_credentials(token) {
+            redacted.push(redact_url_credentials(token));
+            index += 1;
+            continue;
+        }
+
+        let Some(kind) = sensitive_token_kind(token) else {
+            redacted.push(token.to_string());
+            index += 1;
+            continue;
+        };
+
+        redacted.push(redact_token_preserving_key(token));
+        index += 1;
+
+        if index < tokens.len() && matches!(tokens[index], "=" | ":") {
+            redacted.push(tokens[index].to_string());
+            index += 1;
+        }
+
+        if kind == SensitiveInstallerTokenKind::Authorization
+            && index < tokens.len()
+            && tokens[index].eq_ignore_ascii_case("bearer")
+        {
+            redacted.push("[redacted]".to_string());
+            index += 1;
+        }
+
+        if !has_inline_secret_value(token) && index < tokens.len() {
+            redacted.push("[redacted]".to_string());
+            index += 1;
+        }
+    }
+
+    redacted.join(" ")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SensitiveInstallerTokenKind {
+    Authorization,
+    Other,
+}
+
+fn sensitive_token_kind(token: &str) -> Option<SensitiveInstallerTokenKind> {
+    let lower = token.to_ascii_lowercase();
+    let key = [
+        "authorization",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "github_token",
+        "x-goog-api-key",
+        "_authtoken",
+        "_auth-token",
+        "_auth",
+        "npm_config_//",
+    ]
+    .into_iter()
+    .find(|key| token_contains_sensitive_key(&lower, key))?;
+
+    if key == "authorization" {
+        Some(SensitiveInstallerTokenKind::Authorization)
+    } else {
+        Some(SensitiveInstallerTokenKind::Other)
+    }
+}
+
+fn token_contains_sensitive_key(token: &str, key: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_index) = token[search_start..].find(key) {
+        let start = search_start + relative_index;
+        let end = start + key.len();
+        let before = token[..start].chars().next_back();
+        let after = token[end..].chars().next();
+        let before_ok = before
+            .map(|character| !character.is_ascii_alphanumeric())
+            .unwrap_or(true);
+        let after_ok = after
+            .map(|character| !character.is_ascii_alphanumeric())
+            .unwrap_or(true);
+
+        if before_ok && after_ok {
+            return true;
+        }
+
+        search_start = end;
+    }
+
+    false
+}
+
+fn has_inline_secret_value(token: &str) -> bool {
+    token
+        .find(['=', ':'])
+        .map(|index| index + 1 < token.len())
+        .unwrap_or(false)
+}
+
+fn redact_token_preserving_key(token: &str) -> String {
+    token
+        .find(['=', ':'])
+        .map(|index| format!("{}[redacted]", &token[..=index]))
+        .unwrap_or_else(|| "[redacted]".to_string())
+}
+
+fn looks_like_url_with_credentials(token: &str) -> bool {
+    token
+        .find("://")
+        .and_then(|scheme_end| token[scheme_end + 3..].find('@'))
+        .is_some()
+}
+
+fn redact_url_credentials(token: &str) -> String {
+    let Some(scheme_end) = token.find("://") else {
+        return token.to_string();
+    };
+    let rest_start = scheme_end + 3;
+    let Some(at_offset) = token[rest_start..].find('@') else {
+        return token.to_string();
+    };
+    format!(
+        "{}[redacted]@{}",
+        &token[..rest_start],
+        &token[rest_start + at_offset + 1..]
+    )
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, character) in input.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("...");
+            return output;
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn session_state() -> &'static Mutex<InstallerSessionState> {
@@ -900,8 +1084,10 @@ fn terminate_child_process_tree(child: &mut std::process::Child) -> Option<Strin
             match process.status() {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
-                    cleanup_failure_detail =
-                        Some(timeout_cleanup_failure_detail(&command, &status.to_string()));
+                    cleanup_failure_detail = Some(timeout_cleanup_failure_detail(
+                        &command,
+                        &status.to_string(),
+                    ));
                 }
                 Err(error) => {
                     cleanup_failure_detail =

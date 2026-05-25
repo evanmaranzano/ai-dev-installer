@@ -51,6 +51,31 @@ test("submits image request and renders returned image", async () => {
   );
 });
 
+test("does not render image payloads with unsupported mime types", async () => {
+  const user = userEvent.setup();
+
+  mockedGenerateImage.mockResolvedValueOnce({
+    images: [
+      {
+        mimeType: "image/svg+xml",
+        data: "PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+PC9zdmc+"
+      }
+    ]
+  });
+
+  render(<ImagePage defaultModel="gemini-2.0-flash-preview-image-generation" />);
+
+  await user.type(screen.getByRole("textbox", { name: "输入图片提示词" }), "一张图");
+  await user.click(screen.getByRole("button", { name: "生成" }));
+
+  await waitFor(() => {
+    expect(mockedGenerateImage).toHaveBeenCalled();
+  });
+
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  expect(screen.getByRole("status")).toHaveTextContent("已隐藏不支持的图片格式");
+});
+
 test("disables prompt input and generate button when actions are disabled", () => {
   render(<ImagePage actionsEnabled={false} />);
 

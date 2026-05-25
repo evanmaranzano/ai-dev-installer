@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
+const BUNDLED_MANIFEST_JSON: &str = include_str!("../../../resources/third_party/manifest.json");
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BundledResource {
@@ -36,6 +37,10 @@ impl InstallerManifest {
             message: "Failed to parse installer manifest".into(),
             details: Some(error.to_string()),
         })
+    }
+
+    pub fn bundled() -> Result<Self, AppError> {
+        Self::from_json_str(BUNDLED_MANIFEST_JSON)
     }
 }
 

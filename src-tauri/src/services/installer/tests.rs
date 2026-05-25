@@ -11,8 +11,8 @@ use crate::services::installer::executor::{
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 use crate::services::installer::service::{
     codex_store_install_failure_error, component_status, mark_component_skipped_if_installed,
-    timeout_cleanup_failure_detail, timeout_process_tree_kill_command, InstallerService,
-    InstallerSessionState,
+    sanitize_installer_command_output, timeout_cleanup_failure_detail,
+    timeout_process_tree_kill_command, InstallerService, InstallerSessionState,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -371,10 +371,12 @@ fn plans_microsoft_store_service_repair_before_codex_install() {
 
 #[test]
 fn plans_microsoft_store_product_page_wakeup_for_codex() {
-    let command =
-        microsoft_store_product_page_command().expect("store page command should build");
+    let command = microsoft_store_product_page_command().expect("store page command should build");
 
-    assert_eq!(microsoft_store_product_uri(), "ms-windows-store://pdp/?ProductId=9PLM9XGG6VKS");
+    assert_eq!(
+        microsoft_store_product_uri(),
+        "ms-windows-store://pdp/?ProductId=9PLM9XGG6VKS"
+    );
     assert!(command
         .program
         .to_ascii_lowercase()
@@ -391,7 +393,9 @@ fn codex_store_failure_error_mentions_service_repair_and_store_wakeup() {
     });
 
     assert_eq!(error.code, "installer_codex_store_install_failed");
-    let details = error.details.expect("details should explain recovery actions");
+    let details = error
+        .details
+        .expect("details should explain recovery actions");
     assert!(details.contains("Microsoft Store"));
     assert!(details.contains("App Installer"));
     assert!(details.contains("AppXSvc"));
@@ -415,14 +419,14 @@ fn plans_claude_code_install_with_official_npm_package() {
     fs::write(&npm_path, b"@echo off\r\n").expect("fake npm should be written");
 
     let original_path = std::env::var_os("PATH");
-    let original_program_files = std::env::var_os("ProgramFiles");
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
     std::env::set_var("PATH", "");
-    std::env::set_var("ProgramFiles", &temp_root);
+    std::env::set_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", &temp_root);
 
     let commands = claude_code_install_commands().expect("claude command should build");
 
     restore_env_var("PATH", original_path);
-    restore_env_var("ProgramFiles", original_program_files);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
     fs::remove_dir_all(&temp_root).expect("temp root should be removed");
 
     assert_eq!(commands.len(), 1);
@@ -432,9 +436,44 @@ fn plans_claude_code_install_with_official_npm_package() {
         vec![
             "install".to_string(),
             "-g".to_string(),
-            "@anthropic-ai/claude-code".to_string(),
+            "@anthropic-ai/claude-code@2.1.150".to_string(),
         ]
     );
+}
+
+#[test]
+fn environment_detection_ignores_untrusted_path_programs() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-env-spoof-{unique}"));
+    let untrusted_dir = temp_root.join("user-bin");
+    let spoofed_tool = untrusted_dir.join("evil-tool.cmd");
+
+    fs::create_dir_all(&untrusted_dir).expect("untrusted dir should be created");
+    fs::write(&spoofed_tool, b"@echo off\r\necho evil-tool 9.9.9\r\n")
+        .expect("spoofed command should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_program_files = std::env::var_os("ProgramFiles");
+    let original_program_files_x86 = std::env::var_os("ProgramFiles(x86)");
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+    std::env::set_var("PATH", &untrusted_dir);
+    std::env::set_var("ProgramFiles", temp_root.join("Program Files"));
+    std::env::set_var("ProgramFiles(x86)", temp_root.join("Program Files (x86)"));
+    std::env::remove_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+
+    let detected = DetectExecutionEnvironment::new().detect_binary("evil-tool");
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("ProgramFiles", original_program_files);
+    restore_env_var("ProgramFiles(x86)", original_program_files_x86);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert!(detected.is_none());
 }
 
 #[test]
@@ -452,14 +491,14 @@ fn plans_claude_code_install_with_refreshed_program_files_path() {
     fs::write(&npm_path, b"@echo off\r\n").expect("fake npm command should be written");
 
     let original_path = std::env::var_os("PATH");
-    let original_program_files = std::env::var_os("ProgramFiles");
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
     std::env::set_var("PATH", "");
-    std::env::set_var("ProgramFiles", &temp_root);
+    std::env::set_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", &temp_root);
 
     let commands = claude_code_install_commands().expect("claude command should build");
 
     restore_env_var("PATH", original_path);
-    restore_env_var("ProgramFiles", original_program_files);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
     fs::remove_dir_all(&temp_root).expect("fake program files dir should be removed");
 
     assert_eq!(commands[0].program, npm_path.display().to_string());
@@ -481,12 +520,12 @@ fn rejects_executable_path_that_only_prefix_matches_trusted_directory() {
     fs::create_dir_all(spoofed_npm.parent().unwrap()).expect("spoofed dir should be created");
     fs::write(&spoofed_npm, b"@echo off\r\n").expect("spoofed npm should be written");
 
-    let original_program_files = std::env::var_os("ProgramFiles");
-    std::env::set_var("ProgramFiles", &trusted_root);
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+    std::env::set_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", &trusted_root);
 
     let trusted = is_in_trusted_directory(&spoofed_npm);
 
-    restore_env_var("ProgramFiles", original_program_files);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
     fs::remove_dir_all(&temp_root).expect("temp root should be removed");
 
     assert!(!trusted);
@@ -512,6 +551,74 @@ fn does_not_fall_back_to_unqualified_program_from_untrusted_path() {
     let found = find_program_on_path_trusted("untrusted-tool");
 
     restore_env_var("PATH", original_path);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert_eq!(found, None);
+}
+
+#[test]
+fn does_not_trust_program_files_environment_override() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-program-files-env-{unique}"));
+    let spoofed_npm = temp_root.join("nodejs").join("npm.cmd");
+
+    fs::create_dir_all(spoofed_npm.parent().unwrap()).expect("spoofed dir should be created");
+    fs::write(&spoofed_npm, b"@echo off\r\n").expect("spoofed npm should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_program_files = std::env::var_os("ProgramFiles");
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+    std::env::set_var("PATH", "");
+    std::env::set_var("ProgramFiles", &temp_root);
+    std::env::remove_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+
+    let found = find_program_on_path_trusted("npm");
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("ProgramFiles", original_program_files);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert_ne!(
+        found.as_deref(),
+        Some(
+            spoofed_npm
+                .to_str()
+                .expect("spoofed npm path should be utf8")
+        )
+    );
+}
+
+#[test]
+fn does_not_trust_programs_under_unapproved_windows_subdirectories() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-windows-temp-{unique}"));
+    let windows_root = temp_root.join("Windows");
+    let spoofed_tool = windows_root.join("Temp").join("temp-spoof.cmd");
+
+    fs::create_dir_all(spoofed_tool.parent().unwrap()).expect("spoofed dir should be created");
+    fs::write(&spoofed_tool, b"@echo off\r\n").expect("spoofed npm should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+    std::env::set_var("PATH", spoofed_tool.parent().unwrap());
+    std::env::set_var(
+        "AI_DEV_INSTALLER_TEST_TRUST_ROOT",
+        windows_root.join("System32"),
+    );
+
+    let found = find_program_on_path_trusted("temp-spoof");
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
     fs::remove_dir_all(&temp_root).expect("temp root should be removed");
 
     assert_eq!(found, None);
@@ -567,16 +674,54 @@ fn timeout_cleanup_targets_the_child_process_tree() {
 }
 
 #[test]
+fn loads_bundled_manifest_from_compiled_trust_root() {
+    let manifest = InstallerManifest::bundled().expect("bundled manifest should parse");
+
+    assert_eq!(manifest.resources.len(), 4);
+    assert_eq!(
+        manifest
+            .resource("git")
+            .expect("git resource should exist")
+            .sha256,
+        "2b96e7854f0520f0f6b709c21041d9801b1be44d5e1a0d9fa621b2fbc40f1983"
+    );
+}
+
+#[test]
 fn timeout_cleanup_failure_detail_includes_cleanup_command_and_reason() {
     let command = crate::services::installer::executor::PlannedCommand {
         program: "taskkill.exe".to_string(),
-        args: vec!["/PID".to_string(), "1234".to_string(), "/T".to_string(), "/F".to_string()],
+        args: vec![
+            "/PID".to_string(),
+            "1234".to_string(),
+            "/T".to_string(),
+            "/F".to_string(),
+        ],
     };
 
     let detail = timeout_cleanup_failure_detail(&command, "exit code 128");
 
     assert!(detail.contains("taskkill.exe /PID 1234 /T /F"));
     assert!(detail.contains("exit code 128"));
+}
+
+#[test]
+fn installer_command_output_is_redacted_and_limited_before_ui_logs() {
+    let output = "Authorization: Bearer secret-token password hunter2 token npm-secret --api-key=cli-secret GITHUB_TOKEN=ghp_secret _authToken=npm-inline //registry.npmjs.org/:_authToken=npm-token https://user:pass@example.invalid/private\n".repeat(80);
+
+    let sanitized = sanitize_installer_command_output(&output)
+        .expect("non-empty diagnostic output should be retained");
+
+    assert!(!sanitized.contains("secret-token"));
+    assert!(!sanitized.contains("hunter2"));
+    assert!(!sanitized.contains("npm-secret"));
+    assert!(!sanitized.contains("cli-secret"));
+    assert!(!sanitized.contains("ghp_secret"));
+    assert!(!sanitized.contains("npm-inline"));
+    assert!(!sanitized.contains("npm-token"));
+    assert!(!sanitized.contains("user:pass"));
+    assert!(sanitized.contains("[redacted]"));
+    assert!(sanitized.len() <= 2051);
 }
 
 #[test]
@@ -772,7 +917,9 @@ fn installer_service_returns_stage_names_for_requested_flow() {
     let service = InstallerService::production();
 
     assert_eq!(
-        service.stage_sequence_for("install_codex").expect("known flow should return stages"),
+        service
+            .stage_sequence_for("install_codex")
+            .expect("known flow should return stages"),
         vec![
             "Preflight".to_string(),
             "InstallGit".to_string(),
@@ -785,7 +932,9 @@ fn installer_service_returns_stage_names_for_requested_flow() {
         ]
     );
     assert_eq!(
-        service.stage_sequence_for("install_claude_code").expect("known flow should return stages"),
+        service
+            .stage_sequence_for("install_claude_code")
+            .expect("known flow should return stages"),
         vec![
             "Preflight".to_string(),
             "InstallGit".to_string(),
@@ -798,7 +947,9 @@ fn installer_service_returns_stage_names_for_requested_flow() {
         ]
     );
     assert_eq!(
-        service.stage_sequence_for("install_all").expect("known flow should return stages"),
+        service
+            .stage_sequence_for("install_all")
+            .expect("known flow should return stages"),
         vec![
             "Preflight".to_string(),
             "InstallGit".to_string(),

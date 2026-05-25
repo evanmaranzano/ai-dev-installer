@@ -81,3 +81,19 @@ test("shows an error message when subtitle extraction fails", async () => {
     expect(screen.getByRole("alert")).toHaveTextContent("提取失败，请稍后重试。");
   });
 });
+
+test("rejects files that are too large before reading them into memory", async () => {
+  const user = userEvent.setup();
+  mockedExtractSubtitles.mockClear();
+  const file = new File(["x"], "large.wav", { type: "audio/wav" });
+  Object.defineProperty(file, "size", { value: 51 * 1024 * 1024 });
+
+  render(<SubtitlePage />);
+
+  const input = screen.getByLabelText("选择音视频文件") as HTMLInputElement;
+  fireEvent.change(input, { target: { files: [file] } });
+  await user.click(screen.getByRole("button", { name: "提取字幕" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("文件过大（超过 50MB）");
+  expect(mockedExtractSubtitles).not.toHaveBeenCalled();
+});

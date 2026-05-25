@@ -112,6 +112,29 @@ test("formats structured tauri command errors instead of object strings", async 
   mockedStartInstallFlow.mockClear();
 });
 
+test("ignores duplicate install clicks while a flow request is pending", async () => {
+  const user = userEvent.setup();
+  let resolveInstall!: () => void;
+  mockedStartInstallFlow.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveInstall = resolve;
+      })
+  );
+
+  render(<App />);
+
+  await screen.findByRole("heading", { name: "AI Dev Installer", level: 1 });
+  await user.dblClick(screen.getByRole("button", { name: "全部安装" }));
+
+  expect(mockedStartInstallFlow).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    resolveInstall();
+  });
+  mockedStartInstallFlow.mockClear();
+});
+
 test("keeps install actions disabled while environment refresh is pending", async () => {
   const user = userEvent.setup();
   let resolveRefresh!: (value: Awaited<ReturnType<typeof refreshInstallerSnapshot>>) => void;

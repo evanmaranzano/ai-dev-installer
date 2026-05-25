@@ -1,9 +1,12 @@
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 use crate::models::installer::{InstallStageId, InstallerLogEntry};
 
 const CODEX_STORE_PRODUCT_ID: &str = "9PLM9XGG6VKS";
+const CLAUDE_CODE_PACKAGE_SPEC: &str = "@anthropic-ai/claude-code@2.1.150";
 
 pub struct StageExecutionResult {
     pub next_stage: InstallStageId,
@@ -45,22 +48,9 @@ pub fn microsoft_store_service_repair_commands() -> Result<Vec<PlannedCommand>, 
     let sc = windows_system_program("sc.exe")?;
     Ok(["AppXSvc", "ClipSVC", "InstallService"]
         .into_iter()
-        .flat_map(|service| {
-            [
-                PlannedCommand {
-                    program: sc.clone(),
-                    args: vec![
-                        "config".into(),
-                        service.into(),
-                        "start=".into(),
-                        "demand".into(),
-                    ],
-                },
-                PlannedCommand {
-                    program: sc.clone(),
-                    args: vec!["start".into(), service.into()],
-                },
-            ]
+        .map(|service| PlannedCommand {
+            program: sc.clone(),
+            args: vec!["start".into(), service.into()],
         })
         .collect())
 }
@@ -83,7 +73,7 @@ pub fn claude_code_install_commands() -> Result<Vec<PlannedCommand>, AppError> {
         args: vec![
             "install".into(),
             "-g".into(),
-            "@anthropic-ai/claude-code".into(),
+            CLAUDE_CODE_PACKAGE_SPEC.into(),
         ],
     }])
 }
@@ -152,6 +142,9 @@ pub(super) fn is_in_trusted_directory(path: &Path) -> bool {
     trusted_directory_roots()
         .into_iter()
         .any(|root| path_is_inside(&root, path))
+        || trusted_file_paths()
+            .into_iter()
+            .any(|root| path_matches_trusted_file(&root, path))
 }
 
 fn is_trusted_winget_path(path: &Path) -> bool {
@@ -209,18 +202,9 @@ fn known_program_candidate_paths(program: &str) -> Vec<PathBuf> {
 }
 
 fn push_base_candidates(candidates: &mut Vec<PathBuf>, relative_paths: &[&str]) {
-    #[cfg(test)]
-    for env_name in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-        if let Some(base) = std::env::var_os(env_name) {
-            for relative_path in relative_paths {
-                candidates.push(PathBuf::from(&base).join(relative_path));
-            }
-        }
-    }
-
-    for base in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+    for base in program_files_roots() {
         for relative_path in relative_paths {
-            candidates.push(Path::new(base).join(relative_path));
+            candidates.push(base.join(relative_path));
         }
     }
 }
@@ -284,18 +268,42 @@ fn push_windows_program_candidates(candidates: &mut Vec<PathBuf>, root: &Path, p
 fn trusted_directory_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
-    for root in [r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)"] {
+    for root in [
+        r"C:\Windows\System32",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+    ] {
         roots.push(PathBuf::from(root));
     }
 
     #[cfg(test)]
-    for env in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(dir) = std::env::var_os(env) {
-            roots.push(PathBuf::from(dir));
-        }
-    }
+    roots.extend(test_trusted_roots());
 
     roots
+}
+
+fn trusted_file_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from(r"C:\Windows\explorer.exe")]
+}
+
+fn program_files_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    #[cfg(test)]
+    roots.extend(test_trusted_roots());
+
+    roots.push(PathBuf::from(r"C:\Program Files"));
+    roots.push(PathBuf::from(r"C:\Program Files (x86)"));
+
+    roots
+}
+
+#[cfg(test)]
+fn test_trusted_roots() -> Vec<PathBuf> {
+    std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT")
+        .into_iter()
+        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .collect()
 }
 
 fn winget_windows_apps_roots() -> Vec<PathBuf> {
@@ -303,7 +311,11 @@ fn winget_windows_apps_roots() -> Vec<PathBuf> {
 
     #[cfg(test)]
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local_app_data).join("Microsoft").join("WindowsApps"));
+        roots.push(
+            PathBuf::from(local_app_data)
+                .join("Microsoft")
+                .join("WindowsApps"),
+        );
     }
 
     if let Some(local_app_data) = dirs::data_local_dir() {
@@ -314,6 +326,11 @@ fn winget_windows_apps_roots() -> Vec<PathBuf> {
 }
 
 fn path_is_inside(root: &Path, path: &Path) -> bool {
+    // Reject junction/symlink points: check each component before canonicalization
+    if has_reparse_point_ancestor(path) {
+        return false;
+    }
+
     let Ok(root) = root.canonicalize() else {
         return false;
     };
@@ -322,6 +339,40 @@ fn path_is_inside(root: &Path, path: &Path) -> bool {
     };
 
     path.starts_with(root)
+}
+
+#[cfg(target_os = "windows")]
+fn has_reparse_point_ancestor(path: &Path) -> bool {
+    let mut current = path.to_path_buf();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || (meta.file_attributes() & 0x400) != 0 {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+        if !current.pop() {
+            return false;
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn has_reparse_point_ancestor(_path: &Path) -> bool {
+    false
+}
+
+fn path_matches_trusted_file(root: &Path, path: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+
+    path == root
 }
 
 fn trusted_program_missing(program: &str) -> AppError {

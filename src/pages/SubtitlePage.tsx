@@ -2,6 +2,8 @@ import { useState } from "react";
 import { extractSubtitles } from "../lib/subtitles";
 import type { SubtitleSegment, TranscriptResult } from "../lib/types";
 
+const MAX_SUBTITLE_UPLOAD_BYTES = 50 * 1024 * 1024;
+
 interface SubtitlePageProps {
   actionsEnabled?: boolean;
   defaultModel?: string;
@@ -46,8 +48,8 @@ export function SubtitlePage({
     setIsExtracting(true);
     try {
       setErrorMessage("");
-      if (selectedFile.size > 200 * 1024 * 1024) {
-        setErrorMessage("文件过大（超过 200MB），请选择更小的文件。");
+      if (selectedFile.size > MAX_SUBTITLE_UPLOAD_BYTES) {
+        setErrorMessage("文件过大（超过 50MB），请选择更小的文件。");
         return;
       }
       const data = await readFileBytes(selectedFile);

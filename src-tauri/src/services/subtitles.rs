@@ -89,9 +89,7 @@ pub fn validate_export_dir(export_dir: &str) -> Result<(), AppError> {
     }
 
     let normalized = trimmed.replace('/', r"\");
-    let lower = normalized
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
+    let lower = normalized.trim_end_matches('\\').to_ascii_lowercase();
 
     if normalized.starts_with(r"\\") || !Path::new(trimmed).is_absolute() {
         return Err(invalid_export_dir(export_dir));
@@ -161,12 +159,15 @@ pub fn write_srt_artifact(
         details: Some(error.to_string()),
     })?;
 
-    let stem = Path::new(file_name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("transcript");
-    let export_path = Path::new(export_dir).join(format!("{stem}.srt"));
+    let export_dir = fs::canonicalize(export_dir).map_err(|error| AppError {
+        code: "export_write_failed".to_string(),
+        message: "Failed to resolve export directory".to_string(),
+        details: Some(error.to_string()),
+    })?;
+    validate_export_dir(&normalized_export_dir_for_validation(&export_dir))?;
+
+    let stem = sanitized_export_stem(file_name);
+    let export_path = export_dir.join(format!("{stem}.srt"));
     let srt = render_srt(segments);
 
     fs::write(&export_path, srt).map_err(|error| AppError {
@@ -179,4 +180,72 @@ pub fn write_srt_artifact(
         path: export_path.to_string_lossy().to_string(),
         kind: ExportArtifactKind::Srt,
     })
+}
+
+fn normalized_export_dir_for_validation(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+}
+
+fn sanitized_export_stem(file_name: &str) -> String {
+    if file_name.contains(['/', '\\', ':']) {
+        return "transcript".to_string();
+    }
+
+    let Some(stem) = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return "transcript".to_string();
+    };
+
+    let sanitized = stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['.', ' ', '_'])
+        .to_string();
+
+    if sanitized.is_empty() || is_reserved_windows_file_stem(&sanitized) {
+        "transcript".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn is_reserved_windows_file_stem(stem: &str) -> bool {
+    let lower = stem.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
 }
