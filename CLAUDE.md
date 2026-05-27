@@ -32,6 +32,10 @@ CARGO_TARGET_DIR=src-tauri/target-test cargo test --manifest-path src-tauri/Carg
 版本号 → `npm run tauri build` → commit/tag/push → `gh release create`
 未授权不执行 git 写操作。
 
+## Release 产物
+NSIS 安装器: `src-tauri/target/release/bundle/nsis/AI Dev Installer_<version>_x64-setup.exe`
+`gh release create v<ver> "./src-tauri/target/release/bundle/nsis/AI Dev Installer_<ver>_x64-setup.exe" --title "v<ver>" --notes "..."`
+
 ## 数据路径
 - 设置: `%APPDATA%/AI Dev Installer/settings.json`
 - 历史: `%LOCALAPPDATA%/AI Dev Installer/history.sqlite3`
