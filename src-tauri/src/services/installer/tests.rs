@@ -3,10 +3,11 @@ use crate::services::installer::environment::{
     build_initial_snapshot, DetectExecutionEnvironment, DetectedBinary, EnvironmentProbe,
 };
 use crate::services::installer::executor::{
-    claude_code_install_commands, codex_install_commands, command_display,
-    find_program_on_path_trusted, is_in_trusted_directory, microsoft_store_product_page_command,
-    microsoft_store_product_uri, microsoft_store_service_repair_commands, stage_sequence,
-    third_party_install_command, winget_candidate_paths,
+    claude_code_install_commands, codex_install_commands, codex_npm_fallback_command,
+    command_display, find_program_on_path_trusted, is_in_trusted_directory,
+    microsoft_store_product_page_command, microsoft_store_product_uri,
+    microsoft_store_service_repair_commands, stage_sequence, third_party_install_command,
+    winget_candidate_paths,
 };
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 use crate::services::installer::service::{
@@ -340,12 +341,47 @@ fn plans_codex_install_with_msstore_winget_product_id() {
 }
 
 #[test]
+fn plans_codex_npm_fallback_when_winget_unavailable() {
+    let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    let temp_root = std::env::temp_dir().join(format!("installer-npm-fallback-{unique}"));
+    let npm_path = temp_root.join("nodejs").join("npm.cmd");
+
+    fs::create_dir_all(npm_path.parent().unwrap()).expect("fake npm dir should be created");
+    fs::write(&npm_path, b"@echo off\r\n").expect("fake npm should be written");
+
+    let original_path = std::env::var_os("PATH");
+    let original_test_trust_root = std::env::var_os("AI_DEV_INSTALLER_TEST_TRUST_ROOT");
+    std::env::set_var("PATH", "");
+    std::env::set_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", &temp_root);
+
+    let command = codex_npm_fallback_command().expect("npm fallback command should build");
+
+    restore_env_var("PATH", original_path);
+    restore_env_var("AI_DEV_INSTALLER_TEST_TRUST_ROOT", original_test_trust_root);
+    fs::remove_dir_all(&temp_root).expect("temp root should be removed");
+
+    assert_eq!(command.program, npm_path.display().to_string());
+    assert_eq!(
+        command.args,
+        vec![
+            "install".to_string(),
+            "-g".to_string(),
+            "@openai/codex".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn plans_microsoft_store_service_repair_before_codex_install() {
     let commands =
         microsoft_store_service_repair_commands().expect("store repair commands should build");
     let command_lines: Vec<String> = commands.iter().map(command_display).collect();
 
-    assert_eq!(commands.len(), 6);
+    assert_eq!(commands.len(), 8);
     assert!(commands
         .iter()
         .all(|command| command.program.to_ascii_lowercase().ends_with("sc.exe")));
@@ -367,6 +403,12 @@ fn plans_microsoft_store_service_repair_before_codex_install() {
     assert!(command_lines
         .iter()
         .any(|line| line.ends_with("sc.exe start InstallService")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe config StorSvc start= demand")));
+    assert!(command_lines
+        .iter()
+        .any(|line| line.ends_with("sc.exe start StorSvc")));
 }
 
 #[test]
@@ -401,6 +443,7 @@ fn codex_store_failure_error_mentions_service_repair_and_store_wakeup() {
     assert!(details.contains("AppXSvc"));
     assert!(details.contains("ClipSVC"));
     assert!(details.contains("InstallService"));
+    assert!(details.contains("StorSvc"));
     assert!(details.contains("ms-windows-store://pdp/?ProductId=9PLM9XGG6VKS"));
     assert!(details.contains("0x8A150044"));
 }

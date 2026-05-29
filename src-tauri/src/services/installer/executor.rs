@@ -6,6 +6,7 @@ use crate::error::AppError;
 use crate::models::installer::{InstallStageId, InstallerLogEntry};
 
 const CODEX_STORE_PRODUCT_ID: &str = "9PLM9XGG6VKS";
+const CODEX_NPM_PACKAGE: &str = "@openai/codex";
 const CLAUDE_CODE_PACKAGE_SPEC: &str = "@anthropic-ai/claude-code@2.1.150";
 
 pub struct StageExecutionResult {
@@ -44,15 +45,35 @@ pub fn codex_install_commands() -> Result<Vec<PlannedCommand>, AppError> {
     }])
 }
 
+pub fn codex_npm_fallback_command() -> Result<PlannedCommand, AppError> {
+    Ok(PlannedCommand {
+        program: find_program_on_path_trusted("npm")
+            .ok_or_else(|| trusted_program_missing("npm"))?,
+        args: vec![
+            "install".into(),
+            "-g".into(),
+            CODEX_NPM_PACKAGE.into(),
+        ],
+    })
+}
+
 pub fn microsoft_store_service_repair_commands() -> Result<Vec<PlannedCommand>, AppError> {
     let sc = windows_system_program("sc.exe")?;
-    Ok(["AppXSvc", "ClipSVC", "InstallService"]
-        .into_iter()
-        .map(|service| PlannedCommand {
+    let services = ["AppXSvc", "ClipSVC", "InstallService", "StorSvc"];
+    let mut commands = Vec::with_capacity(services.len() * 2);
+
+    for service in services {
+        commands.push(PlannedCommand {
+            program: sc.clone(),
+            args: vec!["config".into(), service.into(), "start=".into(), "demand".into()],
+        });
+        commands.push(PlannedCommand {
             program: sc.clone(),
             args: vec!["start".into(), service.into()],
-        })
-        .collect())
+        });
+    }
+
+    Ok(commands)
 }
 
 pub fn microsoft_store_product_uri() -> String {

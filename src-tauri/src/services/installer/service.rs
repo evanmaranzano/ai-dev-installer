@@ -16,10 +16,10 @@ use crate::models::installer::{
 };
 use crate::services::installer::environment::{build_initial_snapshot, DetectExecutionEnvironment};
 use crate::services::installer::executor::{
-    bundled_resource_path, claude_code_install_commands, codex_install_commands, command_display,
-    microsoft_store_product_page_command, microsoft_store_product_uri,
-    microsoft_store_service_repair_commands, stage_sequence, third_party_install_command,
-    windows_system_program, PlannedCommand,
+    bundled_resource_path, claude_code_install_commands, codex_install_commands,
+    codex_npm_fallback_command, command_display, microsoft_store_product_page_command,
+    microsoft_store_product_uri, microsoft_store_service_repair_commands, stage_sequence,
+    third_party_install_command, windows_system_program, PlannedCommand,
 };
 use crate::services::installer::manifest::{verify_sha256, InstallerManifest};
 
@@ -527,23 +527,64 @@ impl InstallerService {
 
         let codex_commands = codex_install_commands()?;
         if let Err(store_error) = self.run_commands(&codex_commands, InstallStageId::InstallCodex) {
-            let _ = self.open_microsoft_store_product_page(snapshot);
-            set_component_status(
-                &mut snapshot.components,
-                "codex",
-                InstallerComponentStatus::Failed,
-                "Codex 安装失败".into(),
-                None,
-            );
-            let wrapped_error = codex_store_install_failure_error(store_error);
             snapshot.logs.push(build_log_entry(
                 InstallStageId::InstallCodex,
-                "error",
-                format!("Codex 安装失败：{}", wrapped_error.message),
+                "warn",
+                format!(
+                    "winget msstore 安装失败，尝试 npm 备选方案{}",
+                    format_error_details(&store_error)
+                ),
             ));
             persist_latest_snapshot(snapshot.clone())?;
             emit_snapshot(app, snapshot)?;
-            return Err(wrapped_error);
+
+            match codex_npm_fallback_command() {
+                Ok(npm_command) => {
+                    if let Err(npm_error) =
+                        self.run_command(&npm_command, InstallStageId::InstallCodex)
+                    {
+                        let _ = self.open_microsoft_store_product_page(snapshot);
+                        set_component_status(
+                            &mut snapshot.components,
+                            "codex",
+                            InstallerComponentStatus::Failed,
+                            "Codex 安装失败（winget 和 npm 均失败）".into(),
+                            None,
+                        );
+                        let wrapped_error = codex_install_failure_error(store_error, npm_error);
+                        snapshot.logs.push(build_log_entry(
+                            InstallStageId::InstallCodex,
+                            "error",
+                            format!("Codex 安装失败：{}", wrapped_error.message),
+                        ));
+                        persist_latest_snapshot(snapshot.clone())?;
+                        emit_snapshot(app, snapshot)?;
+                        return Err(wrapped_error);
+                    }
+                }
+                Err(npm_missing) => {
+                    let _ = self.open_microsoft_store_product_page(snapshot);
+                    set_component_status(
+                        &mut snapshot.components,
+                        "codex",
+                        InstallerComponentStatus::Failed,
+                        "Codex 安装失败".into(),
+                        None,
+                    );
+                    let wrapped_error = codex_store_install_failure_error(store_error);
+                    snapshot.logs.push(build_log_entry(
+                        InstallStageId::InstallCodex,
+                        "error",
+                        format!(
+                            "Codex 安装失败：{}（npm 不可用：{}）",
+                            wrapped_error.message, npm_missing.message
+                        ),
+                    ));
+                    persist_latest_snapshot(snapshot.clone())?;
+                    emit_snapshot(app, snapshot)?;
+                    return Err(wrapped_error);
+                }
+            }
         }
 
         set_component_status(
@@ -1246,9 +1287,27 @@ pub(super) fn codex_store_install_failure_error(store_error: AppError) -> AppErr
         code: "installer_codex_store_install_failed".into(),
         message: "Codex desktop installation from Microsoft Store failed".into(),
         details: Some(format!(
-            "{}{}. AI Dev Installer has tried to start Microsoft Store services AppXSvc, ClipSVC, and InstallService, then open {}. Please repair Microsoft Store, Microsoft App Installer, or winget if the page did not open.",
+            "{}{}. AI Dev Installer has tried to start Microsoft Store services AppXSvc, ClipSVC, InstallService, and StorSvc, then open {}. Please repair Microsoft Store, Microsoft App Installer, or winget if the page did not open.",
             store_error.message,
             format_error_details(&store_error),
+            microsoft_store_product_uri()
+        )),
+    }
+}
+
+pub(super) fn codex_install_failure_error(
+    store_error: AppError,
+    npm_error: AppError,
+) -> AppError {
+    AppError {
+        code: "installer_codex_install_failed".into(),
+        message: "Codex installation failed via both Microsoft Store and npm".into(),
+        details: Some(format!(
+            "winget: {}{}. npm: {}{}. AI Dev Installer has opened the Microsoft Store page {}.",
+            store_error.message,
+            format_error_details(&store_error),
+            npm_error.message,
+            format_error_details(&npm_error),
             microsoft_store_product_uri()
         )),
     }
