@@ -2,6 +2,22 @@
 
 Windows 桌面 AI 开发环境安装器。React/TypeScript + Tauri 2/Rust + NSIS。
 
+## 目录结构
+```
+src/                 — React 前端
+├── components/      — UI 组件（ApiKeyCard, InstallerProgress 等）
+├── pages/           — 页面（Chat, Image, Installer, Settings, Subtitle）
+├── lib/             — 业务逻辑（chat, installer, settings, tauri bridge）
+├── App.tsx          — 根组件
+└── routes.tsx       — 路由
+src-tauri/           — Rust 后端
+├── src/commands/    — Tauri 命令（chat, installer, settings 等）
+├── src/services/    — 业务服务（gemini, installer, credentials 等）
+├── src/storage/     — SQLite 存储（db, history）
+└── tests/           — Rust 集成测试
+scripts/             — 构建脚本（含 test-rust.ps1）
+```
+
 ## 技术栈
 - 前端: React 18 + TypeScript + Vite
 - 桌面: Tauri 2 (Rust crate `ai_dev_installer`)
